@@ -1,0 +1,41 @@
+# Dependencies, build/test output and archives
+node_modules/
+coverage/
+*.tgz
+*.zip
+*.log
+
+# Local configuration and credentials (only blank examples may be shared)
+.env
+.env.*
+!.env.example
+.npmrc
+.pi/
+.nibblearn/
+.pi-learn/
+.bili-ai/
+.dsh/
+credentials*.json
+!examples/credentials.example.json
+*.pem
+*.key
+*.p12
+
+# Runtime data if someone selects this repository as PI_LEARN_HOME
+/nibblearn/
+/video-learn/
+/secrets/
+/plans/
+/materials/
+/drafts/
+/jobs/
+/locks/
+/traffic/
+/settings.json
+
+# Machine/editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
