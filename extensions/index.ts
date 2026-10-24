@@ -10,7 +10,7 @@ import { LearnError, ModelRunError, publicError } from "../src/types.ts";
 import type { Draft, ModelRunner, Plan } from "../src/types.ts";
 import { hash, parseJson, validatePlan } from "../src/validate.ts";
 
-const HELP = `# Nibblearn · 啃啃学 · /learn
+const HELP = `# Nibblearn
 
 - setup：创建任意主题的学习计划，选择保存目录
 - plans / use <ID>：选择学习计划
@@ -192,7 +192,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
     }
 
     pi.registerCommand("learn", {
-      description: "Nibblearn 啃啃学：用户自定义学习目标与保存目录，setup / video / import / review",
+      description: "Nibblearn：学习计划与字幕笔记，setup / video / import / review",
       getArgumentCompletions(prefix) {
         return ["setup", "plans", "use", "config", "auth", "video", "import", "reference", "review", "save", "status", "retry", "resume", "cancel"]
           .filter(value => value.startsWith(prefix)).map(value => ({ value, label: value }));

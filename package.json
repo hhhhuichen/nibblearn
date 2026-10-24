@@ -6,15 +6,11 @@
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "bilibili", "learning", "markdown"],
   "engines": { "node": ">=24.0.0" },
-  "files": ["extensions", "src", "vendor", "examples", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+  "files": ["extensions", "src", "vendor", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
   "pi": { "extensions": ["./extensions/index.ts"] },
   "scripts": {
     "start": "pi -e ./extensions/index.ts",
-    "check": "tsc --noEmit",
-    "test": "node --test tests/*.test.ts",
-    "test:loader": "node scripts/check-loader.mjs",
-    "export:github": "node scripts/export-source.mjs",
-    "verify": "npm run check && npm test && npm run test:loader"
+    "check": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.4.0 <2",

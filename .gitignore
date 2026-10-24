@@ -5,7 +5,7 @@ coverage/
 *.zip
 *.log
 
-# Local configuration and credentials (only blank examples may be shared)
+# Local configuration and credentials
 .env
 .env.*
 !.env.example
@@ -16,7 +16,6 @@ coverage/
 .bili-ai/
 .dsh/
 credentials*.json
-!examples/credentials.example.json
 *.pem
 *.key
 *.p12
@@ -32,6 +31,13 @@ credentials*.json
 /locks/
 /traffic/
 /settings.json
+
+# Development-only assets are not part of this source-only repository
+/tests/
+/scripts/
+/examples/
+/.github/
+/GITHUB_UPLOAD.md
 
 # Machine/editor files
 .DS_Store
