@@ -1,7 +1,7 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { LearnError } from "./types.ts";
-import type { Credentials, Plan, Reference, Segment } from "./types.ts";
+import type { Credentials, Plan, Reference, Segment, VisualAssets } from "./types.ts";
 
 export function hash(value: unknown): string {
   return createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
@@ -71,6 +71,23 @@ export function validateSegments(value: unknown): Segment[] {
   if (characters > 120000) throw new LearnError("MATERIAL_TOO_LARGE", "字幕超过第一版 120000 字符上限，请按课程分 P 或片段处理；没有静默截断。");
   return segments.sort((a, b) => a.start - b.start);
 }
+export function validateVisualAssets(value: unknown, segments: Segment[]): VisualAssets {
+  const visual = object(value);
+  if (typeof visual.directory !== "string" || !/^visual-[a-f0-9]{64}$/.test(visual.directory)
+    || !Array.isArray(visual.frames) || !visual.frames.length || visual.frames.length > 24 || visual.frames.length !== segments.length) {
+    throw new LearnError("INVALID_VISUAL_MATERIAL", "画面缓存结构不正确，不能读取图片或按字幕处理。");
+  }
+  const frames = visual.frames.map((entry, index) => {
+    const frame = object(entry), segment = segments[index]!;
+    if (typeof frame.time !== "number" || !Number.isFinite(frame.time) || frame.time < 0
+      || frame.time !== segment.start || frame.time !== segment.end || typeof frame.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(frame.sha256)) {
+      throw new LearnError("INVALID_VISUAL_MATERIAL", "画面索引、时间戳或校验值无效。");
+    }
+    return { time: frame.time, sha256: frame.sha256 };
+  });
+  return { directory: visual.directory, frames };
+}
+
 export function validateCredentials(value: unknown): Credentials {
   const c = object(value);
   const clean = (value: unknown, required: boolean): string => {

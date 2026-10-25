@@ -27,19 +27,37 @@ export interface Segment {
   text: string;
 }
 
+export interface VideoSource {
+  bvid: string;
+  cid: number;
+  aid?: number;
+  part: number;
+  title: string;
+  author: string;
+  sourceUrl: string;
+  duration?: number;
+}
+export interface VisualAssets {
+  /** Directory name under the private materials bucket, never an arbitrary path. */
+  directory: string;
+  frames: { time: number; sha256: string }[];
+}
+
 export interface Material {
   schemaVersion: 1;
   id: string;
-  kind: "bilibili-subtitle" | "imported-subtitle";
+  kind: "bilibili-subtitle" | "imported-subtitle" | "bilibili-visual";
   title: string;
   author: string;
   sourceUrl?: string;
   bvid?: string;
+  aid?: number;
   cid?: number;
   part?: number;
   language: string;
   duration?: number;
   segments: Segment[];
+  visual?: VisualAssets;
   warnings: string[];
   fetchedAt: string;
 }
@@ -73,13 +91,18 @@ export interface ModelRequest {
   system: string;
   prompt: string;
   maxTokens: number;
+  images?: { data: string; mimeType: "image/jpeg" }[];
   signal?: AbortSignal;
 }
 export interface ModelResult {
   text: string;
   usage?: ModelUsage;
 }
-export type ModelRunner = (request: ModelRequest) => Promise<ModelResult>;
+export type ModelRunner = ((request: ModelRequest) => Promise<ModelResult>) & {
+  /** Visual generation requires an explicit capability declaration, not a text-only fallback. */
+  supportsImages?: boolean;
+  maxImagesPerRequest?: number;
+};
 
 export interface Draft {
   schemaVersion: 1;

@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { assertDirectory, atomicText, defaultHome, ensureDirectory, readText, safeChildDirectory, withFileLock } from "./files.ts";
-import { hash, id, object, parseJson, validateCredentials, validatePlan, validateSegments } from "./validate.ts";
+import { hash, id, object, parseJson, validateCredentials, validatePlan, validateSegments, validateVisualAssets } from "./validate.ts";
 import { LearnError } from "./types.ts";
 import type { Credentials, Draft, Material, Plan } from "./types.ts";
 
@@ -71,14 +71,17 @@ export class Store {
   async hasCredentials(): Promise<boolean> { try { await this.credentials(); return true; } catch { return false; } }
   async saveMaterial(material: Omit<Material, "id">): Promise<Material> {
     const segments = validateSegments(material.segments);
-    const value: Material = { ...material, segments, id: hash({ ...material, segments, fetchedAt: undefined }) };
+    const visual = material.kind === "bilibili-visual" ? validateVisualAssets(material.visual, segments) : undefined;
+    const normalized = { ...material, segments, ...(visual ? { visual } : {}) };
+    const value: Material = { ...normalized, id: hash({ ...normalized, fetchedAt: undefined }) };
     await this.write("materials", value.id, value);
     return value;
   }
   async material(key: string): Promise<Material> {
     const value = await this.read<Material>("materials", id(key));
     if (!value) throw new LearnError("NO_MATERIAL", "找不到字幕材料。");
-    return { ...value, segments: validateSegments(value.segments) };
+    const segments = validateSegments(value.segments);
+    return { ...value, segments, ...(value.kind === "bilibili-visual" ? { visual: validateVisualAssets(value.visual, segments) } : {}) };
   }
   async draft(key: string): Promise<Draft> {
     const value = await this.read<Draft>("drafts", id(key));

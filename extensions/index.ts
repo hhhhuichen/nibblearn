@@ -2,10 +2,13 @@ import path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BilibiliProvider, parseVideo } from "../src/bilibili.ts";
+import { availableBrowsers, BilibiliAccount } from "../src/account/index.ts";
+import type { BrowserKind } from "../src/account/index.ts";
 import { ensureDirectory, expandPath, readText } from "../src/files.ts";
 import { Store } from "../src/store.ts";
 import { LearnService } from "../src/service.ts";
 import { importSubtitle } from "../src/subtitles.ts";
+import { findFfmpeg } from "../src/media.ts";
 import { LearnError, ModelRunError, publicError } from "../src/types.ts";
 import type { Draft, ModelRunner, Plan } from "../src/types.ts";
 import { hash, parseJson, validatePlan } from "../src/validate.ts";
@@ -15,8 +18,8 @@ const HELP = `# Nibblearn
 - setup：创建任意主题的学习计划，选择保存目录
 - plans / use <ID>：选择学习计划
 - config：编辑当前计划（修改会产生新版本）
-- auth：在本地对话框配置 Bilibili Cookie，**不要发到聊天里**
-- video <BV号或完整链接>：按当前计划整理字幕，只生成草稿
+- auth：选择 Edge/Chrome，在专用窗口登录 Bilibili，回到 pi 检查并确认账号；无需复制 Cookie
+- video <BV号或完整链接>：优先读取主/备用字幕；无字幕时可人工确认采样画面，只生成草稿
 - import <字幕文件路径>：导入 SRT/VTT/JSON 后生成草稿，不必登录 Bilibili
 - reference <文本文件路径>：添加用户提供的参考材料（.md/.txt，最多8000字符）
 - review [草稿ID] / save [草稿ID]：预览、编辑，确认后保存；绝不覆盖已有文件
@@ -25,8 +28,9 @@ const HELP = `# Nibblearn
 - resume：人工处理登录/验证码后解除本地账号暂停，不绕过平台退避
 - cancel：取消本插件正在执行的任务
 
-使用 pi 当前模型和认证。字幕、学习目标、参考材料会发送给该模型服务。
-第一版仅依据字幕；未浏览网页、未分析画面、无内置 ASR。不自动评论、私信、点赞或播放视频。`;
+使用 pi 当前模型和认证。字幕、学习目标、参考材料会发送给该模型服务；画面兜底另需确认上传图片。
+画面兜底需要已安装的 FFmpeg 和看图模型，只整理离散采样，不代表完整观看或听过视频，无内置语音转写。
+不自动评论、私信、点赞或在浏览器播放视频。`;
 
 function requireUI(ctx: ExtensionContext): void {
   if (!ctx.hasUI) throw new LearnError("UI_REQUIRED", "此操作需要交互确认，请在 pi 终端或支持对话框的 RPC 客户端运行。");
@@ -34,17 +38,26 @@ function requireUI(ctx: ExtensionContext): void {
 function modelRunner(ctx: ExtensionContext): ModelRunner {
   const model = ctx.model;
   if (!model) throw new LearnError("NO_MODEL", "请先在 pi 中选择并登录一个模型。");
-  return async request => {
+  const imageLimits = model.inputLimits?.images;
+  const imageLimit = Math.min(2, imageLimits?.maxPerMessage ?? 2, imageLimits?.maxPerRequest ?? 2);
+  const run: ModelRunner = async request => {
+    const images = request.images ?? [];
+    if (images.length && !model.input.includes("image")) throw new LearnError("VISION_MODEL_REQUIRED", "当前模型不支持图片输入，请通过 /model 切换看图模型。");
+    if (images.length > imageLimit) throw new LearnError("VISION_MODEL_LIMIT", "图片数量超过当前模型的单次上限，没有静默丢弃画面。");
     const maxTokens = Math.min(request.maxTokens, model.maxTokens || request.maxTokens);
-    // UTF-8 bytes deliberately overestimate input tokens. Never silently truncate a course.
-    if (Buffer.byteLength(request.system + request.prompt, "utf8") + maxTokens + 1024 > model.contextWindow) {
+    // Text bytes overestimate tokens; reserve 8192/image, a conservative heuristic, not provider billing.
+    if (Buffer.byteLength(request.system + request.prompt, "utf8") + images.length * 8192 + maxTokens + 1024 > model.contextWindow) {
       throw new LearnError("MODEL_CONTEXT", "当前模型上下文不足，请选择更大上下文模型、减少参考资料或拆分字幕；未截断材料。");
+    }
+    const content = [{ type: "text" as const, text: request.prompt }, ...images.map(image => ({ type: "image" as const, ...image }))];
+    const context = { systemPrompt: request.system, messages: [{ role: "user" as const, content, timestamp: Date.now() }] };
+    if (model.inputLimits?.maxRequestBytes && Buffer.byteLength(JSON.stringify(context), "utf8") + 4096 > model.inputLimits.maxRequestBytes) {
+      throw new LearnError("MODEL_REQUEST_SIZE", "图文请求超过当前模型的请求大小上限，没有截断图片。");
     }
     let response;
     try {
       response = await ctx.modelRegistry.streamSimple(model, {
-        systemPrompt: request.system,
-        messages: [{ role: "user", content: [{ type: "text", text: request.prompt }], timestamp: Date.now() }],
+        ...context,
         // No tools and no conversation history are provided to the nested model.
       }, { signal: request.signal, maxTokens, cacheRetention: "none" }).result();
     } catch {
@@ -56,38 +69,49 @@ function modelRunner(ctx: ExtensionContext): ModelRunner {
     const output = response.content.filter(c => c.type === "text").map(c => c.text).join("\n");
     return { text: output, usage: response.usage };
   };
+  run.supportsImages = model.input.includes("image");
+  run.maxImagesPerRequest = imageLimit;
+  return run;
 }
 
 export function createLearnExtension(options: { home?: string; transport?: typeof fetch } = {}) {
   return function nibblearnPi(pi: ExtensionAPI): void {
     // Registration only. Do not read credentials, create directories or start timers on load.
     const controllers = new Set<AbortController>();
+    const workTasks = new Set<Promise<unknown>>();
+    const accounts = new Set<BilibiliAccount>();
+    let authentication: Promise<void> | undefined;
     const service = () => {
       const store = new Store(options.home);
       return new LearnService(store, new BilibiliProvider(store, options.transport));
     };
     const report = (content: string) => pi.sendMessage({ customType: "nibblearn", content, display: true });
-    const work = async <T>(signal: AbortSignal | undefined, action: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const work = <T>(signal: AbortSignal | undefined, action: (signal: AbortSignal) => Promise<T>): Promise<T> => {
       const controller = new AbortController();
       controllers.add(controller);
       const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-      try { return await action(combined); } finally { controllers.delete(controller); }
+      const task = (async () => { try { return await action(combined); } finally { controllers.delete(controller); } })();
+      workTasks.add(task);
+      void task.then(() => workTasks.delete(task), () => workTasks.delete(task));
+      return task;
     };
     pi.on("session_shutdown", async () => {
       for (const controller of controllers) controller.abort();
       controllers.clear();
+      // Wait for owned FFmpeg processes, temporary downloads and login windows to close.
+      await Promise.allSettled([...workTasks, ...[...accounts].map(account => account.close())]);
     });
 
     const toolOutput = Type.Object({ draftId: Type.String(), title: Type.String(), reused: Type.Boolean() });
     const generateTool = (kind: "video" | "material") => {
       pi.registerTool({
         name: kind === "video" ? "learn_video" : "learn_generate",
-        label: kind === "video" ? "学习视频字幕" : "整理已导入字幕",
+        label: kind === "video" ? "学习视频材料" : "整理已导入材料",
         description: kind === "video"
-          ? "按用户已确认的当前学习计划读取一个 Bilibili 视频（支持 ?p= 指定分 P），调用当前模型生成带证据的本地草稿。无平台写操作，不发布成品。"
-          : "按当前学习计划整理 /learn import 已导入的材料 ID。不会读取任意文件，不发布成品。",
+          ? "按当前学习计划读取一个 Bilibili 视频（支持 ?p= 指定分 P），优先主/备用字幕；缺字幕时必须由用户通过对话框同意下载和图片传输，才进行视觉采样。只生成有来源的草稿，无平台写操作。"
+          : "按当前学习计划整理已导入或已缓存的材料 ID。画面材料须另经用户确认图片传输；不会读取任意文件，不发布成品。",
         promptSnippet: "按用户学习计划生成有来源的字幕笔记草稿；成品保存须由用户运行 /learn review 确认。",
-        promptGuidelines: ["不得索要或通过 read/bash 获取 Cookie；用户用 /learn auth 本地配置。", "草稿不是已核验事实，不使用普通 write 工具绕过 /learn review 发布。"],
+        promptGuidelines: ["不得索要或通过 read/bash 获取 Cookie；用户通过 /learn auth 在专用浏览器登录并确认账号。", "草稿不是已核验事实，不使用普通 write 工具绕过 /learn review 发布。"],
         parameters: Type.Object({ input: Type.String({ description: kind === "video" ? "BV号或完整HTTPS视频链接，分P用?p=2" : "已导入的材料ID" }) }),
         outputSchema: toolOutput,
         executionMode: "sequential",
@@ -97,11 +121,22 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
           const run = modelRunner(ctx);
           const result = await work(signal, async signal => {
             const progress = (message: string) => onUpdate?.({ content: [{ type: "text", text: message }], details: undefined });
-            return kind === "video" ? svc.fromVideo(params.input, run, signal, progress) : svc.fromMaterial(params.input, run, signal, progress);
+            if (kind === "video") return svc.fromVideo(params.input, run, signal, progress, async (source, reason) => {
+              requireUI(ctx);
+              await findFfmpeg();
+              return ctx.ui.confirm("没有可用字幕，改用采样画面？", `${reason}\n\n视频：${source.title}\n分 P：${source.part}；时长：${source.duration ?? "未知"} 秒\n\n将下载当前可访问的视频流（最多 256 MiB），在全程最多采样 ${12 * Math.min(2, run.maxImagesPerRequest ?? 2)} 个时间点，读取画面及底部硬字幕。图片会发送给当前模型，最多 12 次整理请求并消耗额度。\n\n不会处理音频、读取评论或绕过访问限制。这只能生成采样画面概要，可能漏掉重要讲解，不是视频全文。只处理你有权访问的内容；图片可能包含视频中可见的个人信息，请确认允许发送。临时视频会删除，画面保存在本机缓存供复用。是否同意？`, { signal });
+            });
+            const material = await svc.store.material(params.input);
+            if (material.kind === "bilibili-visual") {
+              requireUI(ctx);
+              if (await ctx.ui.confirm("整理缓存的采样画面？", `${material.title}\n共 ${material.segments.length} 个采样时间点。图片、学习目标和参考材料将发送给当前模型并消耗额度。这不是视频全文，也没有音频。是否同意？`, { signal }) !== true) throw new LearnError("VISUAL_DECLINED", "已取消图片传输，没有调用整理模型。");
+            }
+            return svc.fromMaterial(params.input, run, signal, progress);
           });
           const details = { draftId: result.draft.id, title: result.draft.title, reused: result.reused };
+          const visual = (await svc.store.material(result.draft.materialId)).kind === "bilibili-visual";
           return {
-            content: [{ type: "text", text: `${result.reused ? "复用已有草稿（未再次调用整理模型）" : "草稿已生成"}：${result.draft.title}\n草稿ID：${result.draft.id}\n尚未写入成品目录。用户运行 /learn review ${result.draft.id} 预览并确认保存。` }],
+            content: [{ type: "text", text: `${result.reused ? "复用已有草稿（未再次调用整理模型）" : "草稿已生成"}：${result.draft.title}\n${visual ? "材料仅为采样画面，不含声音，不是视频全文或完整课程总结。\n" : ""}草稿ID：${result.draft.id}\n尚未写入成品目录。用户运行 /learn review ${result.draft.id} 预览并确认保存。` }],
             structuredContent: details, details, usage: result.usage,
           };
         },
@@ -123,6 +158,72 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
         return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
       },
     });
+
+    async function authenticate(ctx: ExtensionCommandContext): Promise<void> {
+      requireUI(ctx);
+      if (authentication) throw new LearnError("ACCOUNT_BUSY", "已有登录流程正在进行，请完成该流程，或运行 /learn cancel 取消。");
+      const task = work(ctx.signal, async signal => {
+        let account: BilibiliAccount | undefined;
+        let deadline: AbortSignal | undefined;
+        try {
+          const installed = await availableBrowsers();
+          signal.throwIfAborted();
+          const browsers: { label: string; browser?: BrowserKind }[] = [
+            { label: "自动选择（推荐）" },
+            { label: `Microsoft Edge${installed.includes("edge") ? "（已检测到）" : ""}`, browser: "edge" },
+            { label: `Google Chrome${installed.includes("chrome") ? "（已检测到）" : ""}`, browser: "chrome" },
+          ];
+          const selected = await ctx.ui.select("选择 Bilibili 登录浏览器（只使用已安装的浏览器）", browsers.map(value => value.label), { signal });
+          signal.throwIfAborted();
+          const choice = browsers.find(value => value.label === selected);
+          if (!choice) return;
+          if (await ctx.ui.confirm("打开专用浏览器登录？", "将打开 Nibblearn 的独立登录窗口，不读取日常浏览器配置，也不下载浏览器。首次需在专用窗口登录 B 站，之后通常可复用登录状态；验证码请自行处理。\n\n登录后回到 pi，选择“我已完成登录，检查账号”，再确认昵称和 UID。确认前不会替换插件原有凭据；Cookie 不显示、不发送给模型。\n\n专用浏览器会保留登录状态，包括取消保存时。结束后只关闭本次专用窗口。本次登录最多等待 10 分钟。", { signal }) !== true) return;
+          signal.throwIfAborted();
+          const store = new Store(options.home);
+          account = new BilibiliAccount({ browser: choice.browser, homeDirectory: store.home, credentialStore: store });
+          accounts.add(account);
+          deadline = AbortSignal.timeout(600000);
+          const loginSignal = AbortSignal.any([signal, deadline]);
+          ctx.ui.setStatus("nibblearn-auth", "正在打开专用浏览器…");
+          await account.openLogin({ signal: loginSignal });
+          const browser = account.getBrowserKind() === "chrome" ? "Chrome" : "Edge";
+          const check = "我已完成登录，检查账号", resume = "已处理登录/验证码，恢复验证", cancel = "取消登录";
+          let needsVerification = false;
+          while (true) {
+            loginSignal.throwIfAborted();
+            ctx.ui.setStatus("nibblearn-auth", `请在专用 ${browser} 中登录，再回到 pi 检查账号`);
+            const action = await ctx.ui.select(`请在刚打开的 ${browser} 窗口完成 B 站登录，再选择检查账号。遇到验证码请手动处理，无需找 Cookie。`, needsVerification ? [check, resume, cancel] : [check, cancel], { signal: loginSignal });
+            loginSignal.throwIfAborted();
+            if (action !== check && action !== resume) return;
+            try {
+              if (action === resume && !await account.resumeAfterManualVerification(approvalSignal => ctx.ui.confirm("确认已手动处理登录或验证码？", "请先在专用浏览器中完成登录或验证码，再确认继续。只解除本地人工暂停，不会清除平台要求的等待时间。", { signal: approvalSignal }), { signal: loginSignal })) continue;
+              ctx.ui.setStatus("nibblearn-auth", "正在验证 Bilibili 账号…");
+              const result = await account.authorizeAndSave((identity, approvalSignal) => ctx.ui.confirm("确认使用这个 Bilibili 账号？", `昵称：${identity.name}\nUID：${identity.uid}\n\n确认后将替换本插件的本机登录凭据。凭据文件不加密，依赖当前系统用户权限；不会发送给模型或聊天。\n\n若账号不是你想使用的，请取消，然后重新运行 /learn auth。`, { signal: approvalSignal }), { signal: loginSignal });
+              ctx.ui.notify(result.saved ? "Bilibili 登录态已保存。现在可以运行 /learn video <链接或BV号>；登录失效时重新运行 /learn auth。" : "未保存新的插件凭据，原有凭据保持不变。专用浏览器的登录状态仍会保留。", "info");
+              return;
+            } catch (error) {
+              if (!(error instanceof LearnError) || !["ACCOUNT_LOGIN_REQUIRED", "ACCOUNT_VERIFICATION", "ACCOUNT_PAUSED", "ACCOUNT_CHANGED"].includes(error.code)) throw error;
+              needsVerification ||= ["ACCOUNT_VERIFICATION", "ACCOUNT_PAUSED"].includes(error.code);
+              ctx.ui.notify(publicError(error), "warning");
+              // Only an explicit user action retries or resumes; there is no background polling.
+            }
+          }
+        } catch (error) {
+          if (signal.aborted) return;
+          if (deadline?.aborted) throw new LearnError("ACCOUNT_TIMEOUT", "本次登录已超过 10 分钟，请重新运行 /learn auth。没有持续后台轮询。");
+          throw error;
+        } finally {
+          try { if (account) await account.close(); }
+          finally {
+            if (account) accounts.delete(account);
+            ctx.ui.setStatus("nibblearn-auth", undefined);
+          }
+        }
+      });
+      authentication = task;
+      try { await task; }
+      finally { if (authentication === task) authentication = undefined; }
+    }
 
     async function setup(ctx: ExtensionCommandContext): Promise<void> {
       requireUI(ctx);
@@ -192,7 +293,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
     }
 
     pi.registerCommand("learn", {
-      description: "Nibblearn：学习计划与字幕笔记，setup / video / import / review",
+      description: "Nibblearn：学习计划与视频材料笔记，setup / auth / video / import / review",
       getArgumentCompletions(prefix) {
         return ["setup", "plans", "use", "config", "auth", "video", "import", "reference", "review", "save", "status", "retry", "resume", "cancel"]
           .filter(value => value.startsWith(prefix)).map(value => ({ value, label: value }));
@@ -204,6 +305,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
           if (command === "help") { report(HELP); return; }
           if (command === "setup") { await setup(ctx); return; }
           if (command === "config") { await configure(ctx); return; }
+          if (command === "auth") { await authenticate(ctx); return; }
           if (command === "cancel") {
             for (const controller of controllers) controller.abort();
             ctx.ui.notify("已请求取消本插件任务；取消不会发布文件。", "info"); return;
@@ -221,14 +323,6 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
               key = choice.split(" | ")[0]!;
             }
             report(`当前计划：${(await store.selectPlan(key)).title}`); return;
-          }
-          if (command === "auth") {
-            requireUI(ctx);
-            const value = await ctx.ui.editor("仅本地保存：从浏览器开发者工具复制 Cookie 值，不要发进聊天。留空取消；不会显示旧凭据。", JSON.stringify({ sessdata: "", bili_jct: "", buvid3: "" }, null, 2));
-            if (value === undefined) return;
-            if (!await ctx.ui.confirm("保存本机登录态？", "这将替换本插件的凭据文件，不会发送给模型。文件不加密，继承本机用户权限；输入框也不提供密码遮罩。确认没有在录屏或不受信任的 RPC 客户端中操作。")) return;
-            await store.saveCredentials(parseJson(value));
-            ctx.ui.notify("凭据已保存；未请求 Bilibili，也未回显 Cookie。", "info"); return;
           }
           if (command === "resume") {
             requireUI(ctx);

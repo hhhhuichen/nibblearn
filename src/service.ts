@@ -1,10 +1,11 @@
 import { Store } from "./store.ts";
-import { BilibiliProvider } from "./bilibili.ts";
+import { BilibiliProvider, SubtitlesUnavailable } from "./bilibili.ts";
+import { prepareVisual, visualImages } from "./media.ts";
 import { LearnError, ModelRunError } from "./types.ts";
-import type { Draft, Material, ModelRunner, ModelUsage, Notes, Plan } from "./types.ts";
+import type { Draft, Material, ModelRunner, ModelUsage, Notes, Plan, VideoSource } from "./types.ts";
 import { addUsage, emptyUsage } from "./usage.ts";
 import { hash } from "./validate.ts";
-import { modelPrompt, parseNotes, PROMPT_VERSION, renderMarkdown, splitSegments, SYSTEM_PROMPT } from "./notes.ts";
+import { modelPrompt, parseNotes, PROMPT_VERSION, renderMarkdown, splitSegments, SYSTEM_PROMPT, VISUAL_SYSTEM_PROMPT } from "./notes.ts";
 import { publishMarkdown } from "./files.ts";
 
 export const MAX_MODEL_CALLS = 12;
@@ -12,12 +13,27 @@ export class LearnService {
   readonly store: Store;
   readonly provider: BilibiliProvider;
   constructor(store: Store, provider = new BilibiliProvider(store)) { this.store = store; this.provider = provider; }
-  async fromVideo(input: string, run: ModelRunner, signal?: AbortSignal, progress: (message: string) => void = () => {}): Promise<{ draft: Draft; reused: boolean; usage: ModelUsage }> {
+  async fromVideo(input: string, run: ModelRunner, signal?: AbortSignal, progress: (message: string) => void = () => {}, approveVisual?: (source: VideoSource, reason: string) => Promise<boolean>): Promise<{ draft: Draft; reused: boolean; usage: ModelUsage }> {
     const plan = await this.store.activePlan();
     this.checkConsent(plan);
-    progress("正在获取指定分 P 的字幕（只读）…");
-    const material = await this.provider.load(input, plan.language, signal);
+    progress("正在获取指定分 P 的字幕（主接口及必要时的备用接口，只读）…");
+    let material: Material;
+    try { material = await this.provider.load(input, plan.language, signal); }
+    catch (error) {
+      if (!(error instanceof SubtitlesUnavailable)) throw error;
+      if (!approveVisual) throw error;
+      const batch = this.visualBatch(run);
+      if (await approveVisual(error.source, error.message) !== true) throw new LearnError("VISUAL_DECLINED", "已取消画面采样，没有下载视频或调用整理模型。");
+      signal?.throwIfAborted();
+      material = await prepareVisual(this.provider, error.source, batch * MAX_MODEL_CALLS, signal, progress);
+    }
     return this.generate(plan, material, run, signal, progress);
+  }
+  private visualBatch(run: ModelRunner): number {
+    if (run.supportsImages !== true) throw new LearnError("VISION_MODEL_REQUIRED", "没有可用字幕，画面兜底需要支持图片输入的模型。请通过 /model 切换看图模型，或用 /learn import 导入字幕。");
+    const limit = run.maxImagesPerRequest ?? 2;
+    if (!Number.isFinite(limit) || limit < 1) throw new LearnError("VISION_MODEL_LIMIT", "当前模型不允许图片输入，不能把画面标签当作字幕生成内容。");
+    return Math.min(2, Math.floor(limit));
   }
   async fromMaterial(materialId: string, run: ModelRunner, signal?: AbortSignal, progress: (message: string) => void = () => {}) {
     const plan = await this.store.activePlan();
@@ -29,9 +45,12 @@ export class LearnService {
   }
   async generate(plan: Plan, material: Material, run: ModelRunner, signal?: AbortSignal, progress: (message: string) => void = () => {}) {
     this.checkConsent(plan);
-    const chunks = splitSegments(material.segments);
+    const visual = material.kind === "bilibili-visual";
+    const batch = visual ? this.visualBatch(run) : 0;
+    const indexed = material.segments.map((segment, index) => ({ ...segment, index }));
+    const chunks = visual ? Array.from({ length: Math.ceil(indexed.length / batch) }, (_, index) => indexed.slice(index * batch, (index + 1) * batch)) : splitSegments(material.segments);
     if (chunks.length > MAX_MODEL_CALLS) throw new LearnError("MODEL_BUDGET", `该材料需要 ${chunks.length} 次模型请求，超过 ${MAX_MODEL_CALLS} 次上限；未截断或调用模型，请拆分课程。`);
-    const draftId = hash({ plan, material: material.id, prompt: PROMPT_VERSION });
+    const draftId = hash({ plan, material: material.id, prompt: visual ? `${PROMPT_VERSION}-visual-v1` : PROMPT_VERSION });
     return this.store.lock(`generate-${draftId}`, async () => {
       signal?.throwIfAborted();
       const previous = await this.store.read<Draft>("drafts", draftId);
@@ -45,11 +64,14 @@ export class LearnService {
         at: new Date().toISOString(), history: Array.isArray(prior?.history) ? prior.history : [] };
       await this.store.write("jobs", draftId, { ...job, status: "running", usage });
       try {
+        // Verify every cached image before the first paid call, not halfway through a course.
+        if (visual) for (const segment of indexed) { signal?.throwIfAborted(); await visualImages(this.store, material, [segment.index]); }
         for (let i = 0; i < chunks.length; i++) {
           signal?.throwIfAborted();
-          progress(`正在整理第 ${i + 1}/${chunks.length} 段字幕…`);
+          progress(visual ? `正在整理第 ${i + 1}/${chunks.length} 批采样画面（不是视频全文）…` : `正在整理第 ${i + 1}/${chunks.length} 段字幕…`);
           const request = modelPrompt(plan, material, chunks[i]!, i + 1, chunks.length);
-          const result = await run({ system: SYSTEM_PROMPT, prompt: request, maxTokens: 4500, signal });
+          const images = visual ? await visualImages(this.store, material, chunks[i]!.map(segment => segment.index)) : undefined;
+          const result = await run({ system: visual ? VISUAL_SYSTEM_PROMPT : SYSTEM_PROMPT, prompt: request, maxTokens: 4500, ...(images ? { images } : {}), signal });
           addUsage(usage, result.usage);
           await this.store.write("jobs", draftId, { ...job, status: "running", completedChunks: i + 1, usage });
           signal?.throwIfAborted();
