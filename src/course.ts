@@ -1,17 +1,16 @@
 import type { CourseJob, CourseListing, MaterialDraft, Plan } from "./types.ts";
 import { courseUnitIndex, courseUnitLabel, LearnError } from "./types.ts";
+import { cleanMarkdown } from "./notes.ts";
 
-export const COURSE_DOCUMENT_VERSION = "course-document-v3";
+export const COURSE_DOCUMENT_VERSION = "course-document-v4";
 const titleText = (value: string) => value.replace(/[\x00-\x1f\x7f#]/g, " ").replace(/!\[/g, "\\![").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const clean = (value: string) => value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x1b]/g, "")
-  .replace(/!\[/g, "\\![").replace(/<[^>]*>/g, match => match.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
 const FOOTER = "由 Nibblearn 辅助整理。请核对原始材料；模型补充不等于已核验事实。";
-type Section = "prefix" | "body" | "overview" | "scope" | "supplements" | "references" | "questions" | "caveats" | "evidence";
+type Section = "prefix" | "body" | "overview" | "scope" | "supplements" | "references" | "questions" | "checklist" | "caveats" | "evidence";
 const SECTIONS = new Map<string, Section>([
   ["材料范围与限制", "scope"], ["学习导读", "overview"], ["采样学习导读", "overview"], ["内容概述", "overview"],
   ["学习正文", "body"], ["视频内容整理", "body"], ["采样画面整理（非完整视频总结）", "body"],
   ["补充说明（非视频原话）", "supplements"], ["用户提供的参考材料", "references"],
-  ["自测与检查要点", "questions"], ["自测与后续行动", "questions"], ["待验证与注意事项", "caveats"],
+  ["自测与检查要点", "questions"], ["自测与后续行动", "questions"], ["复习清单", "checklist"], ["待验证与注意事项", "caveats"],
   ["字幕来源索引", "evidence"], ["画面来源索引（不是台词）", "evidence"],
 ]);
 interface Block { section: Section; lines: string[]; shift: number }
@@ -51,14 +50,14 @@ function chapterSections(markdown: string, part: number, plan: Plan, author: str
     } else current.lines.push(line);
   }
   if (fence) throw new LearnError("COURSE_MARKDOWN_INVALID", `${label} 草稿存在未闭合的代码块，可能吞掉后续章节；请先通过 /learn review 修正该分 P 草稿，再重新合并。`);
-  const sections: Chapter["sections"] = { prefix: [], body: [], overview: [], scope: [], supplements: [], references: [], questions: [], caveats: [], evidence: [] };
+  const sections: Chapter["sections"] = { prefix: [], body: [], overview: [], scope: [], supplements: [], references: [], questions: [], checklist: [], caveats: [], evidence: [] };
   for (const block of blocks) {
     let value = block.lines.join("\n");
     if (block.section === "prefix" && recognized) {
       // Exact generated values only: edited metadata and unrelated text remain in source notes.
       const firstFence = block.lines.findIndex(line => /^ {0,3}(?:`{3,}|~{3,})/.test(line));
       let header = (firstFence < 0 ? block.lines : block.lines.slice(0, firstFence)).join("\n");
-      for (const field of [`- 学习计划：${titleText(plan.title)}`, `- 学习目标：${clean(plan.goal)}`, `- 作者：${titleText(author)}`]) {
+      for (const field of [`- 学习计划：${cleanMarkdown(plan.title).replace(/[\r\n#]/g, " ")}`, `- 学习目标：${cleanMarkdown(plan.goal)}`, `- 作者：${cleanMarkdown(author).replace(/[\r\n#]/g, " ")}`]) {
         header = `\n${header}\n`.replace(`\n${field}\n`, "\n").trim();
       }
       value = firstFence < 0 ? header : `${header}\n${block.lines.slice(firstFence).join("\n")}`;
@@ -68,6 +67,11 @@ function chapterSections(markdown: string, part: number, plan: Plan, author: str
     sections[block.section === "prefix" && !recognized ? "body" : block.section].push(value);
   }
   return { part, label, sections };
+}
+
+/** Internal structured view for tutorial synthesis; excludes preamble/private output paths. */
+export function tutorialSections(markdown: string, plan: Plan, author: string, part: number): Chapter["sections"] {
+  return chapterSections(markdown, part, plan, author, `S${part}`).sections;
 }
 
 function transform(value: string, namespace: string, shift: number): string {
@@ -108,7 +112,7 @@ function listItems(value: string): string[] {
 function sharedSection(chapters: Chapter[], section: Section, heading: string): string[] {
   const groups = new Map<string, number[]>();
   for (const chapter of chapters) {
-    const values = chapter.sections[section].flatMap(value => ["scope", "references", "caveats"].includes(section) ? listItems(value) : [value]);
+    const values = chapter.sections[section].flatMap(value => ["scope", "references", "caveats", "checklist"].includes(section) ? listItems(value) : [value]);
     for (const value of values) {
       if (!value.trim()) continue;
       const parts = groups.get(value) ?? [];
@@ -163,6 +167,7 @@ export function renderCourseMarkdown(plan: Plan, original: CourseListing, job: C
   lines.push(...sharedSection(chapters, "supplements", "补充说明（非视频原话）"),
     ...sharedSection(chapters, "references", "用户提供的参考材料"),
     ...sharedSection(chapters, "questions", "自测与检查要点"),
+    ...sharedSection(chapters, "checklist", "复习清单"),
     ...sharedSection(chapters, "scope", "材料范围与限制"),
     ...sharedSection(chapters, "caveats", "待验证与注意事项"),
     "## 来源索引", "");

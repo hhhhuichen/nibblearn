@@ -74,7 +74,7 @@ export interface CoursePartResult {
   visual: boolean;
   reused: boolean;
 }
-export type CourseOutputMode = "separate" | "merged";
+export type CourseOutputMode = "separate" | "merged" | "tutorial";
 export interface CourseJob {
   id: string;
   kind: "course";
@@ -92,6 +92,9 @@ export interface CourseJob {
   outputMode?: CourseOutputMode;
   mergedDraftId?: string;
   mergeError?: string;
+  tutorialDraftId?: string;
+  tutorialJobId?: string;
+  tutorialError?: string;
   stoppedPart?: number;
   error?: string;
   at: string;
@@ -121,10 +124,20 @@ export interface Material {
   fetchedAt: string;
 }
 
+export interface TeachingExample {
+  /** A source example, or an explicit deduction using only source-given conditions. */
+  basis: "material" | "derivation";
+  conditions: string;
+  steps: string[];
+  result: string;
+  interpretation: string;
+  evidence: number[];
+}
 export interface Point {
   heading: string;
   explanation: string;
   evidence: number[];
+  examples?: TeachingExample[];
 }
 export interface Supplement {
   text: string;
@@ -136,6 +149,7 @@ export interface Notes {
   supplements: Supplement[];
   questions: string[];
   caveats: string[];
+  checklist?: string[];
 }
 
 export interface ModelUsage {
@@ -183,9 +197,26 @@ export interface MaterialDraft extends DraftBase {
 }
 export interface CourseDraft extends DraftBase {
   kind: "course";
-  course: { jobId: string; bvid: string; total: number; parts: CoursePartResult[] };
+  course: { jobId: string; bvid: string; total: number; parts: CoursePartResult[]; tutorial?: boolean };
 }
 export type Draft = MaterialDraft | CourseDraft;
+
+export interface TutorialApproval {
+  stage: "budget" | "outline";
+  jobId: string;
+  title: string;
+  sourceParts: number;
+  totalParts: number;
+  units: number;
+  visualSourceParts: number;
+  excludedSupplementBlocks: number;
+  maxNewCalls: number;
+  completedChapters: number;
+  resuming: boolean;
+  chapters?: string[];
+  omitted?: { count: number; reason: string }[];
+}
+export type ApproveTutorial = (summary: TutorialApproval, signal?: AbortSignal) => Promise<boolean>;
 
 export interface Credentials {
   sessdata: string;

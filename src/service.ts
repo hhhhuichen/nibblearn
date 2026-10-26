@@ -2,12 +2,13 @@ import { Store } from "./store.ts";
 import { BilibiliProvider, parseCourseInputs, SubtitlesUnavailable } from "./bilibili.ts";
 import { prepareVisual, visualImages } from "./media.ts";
 import { courseUnitIndex, courseUnitLabel, LearnError, ModelRunError, publicError } from "./types.ts";
-import type { CourseDraft, CourseJob, CourseListing, CourseOutputMode, CoursePartResult, CourseScope, Draft, Material, MaterialDraft, ModelRunner, ModelUsage, Notes, Plan, VideoSource } from "./types.ts";
+import type { CourseDraft, CourseJob, CourseListing, CourseOutputMode, CoursePartResult, CourseScope, ApproveTutorial, Draft, Material, MaterialDraft, ModelRunner, ModelUsage, Notes, Plan, VideoSource } from "./types.ts";
 import { addUsage, emptyUsage } from "./usage.ts";
 import { hash } from "./validate.ts";
 import { modelPrompt, parseNotes, PROMPT_VERSION, renderMarkdown, splitSegments, SYSTEM_PROMPT, VISUAL_SYSTEM_PROMPT } from "./notes.ts";
 import { publishMarkdown } from "./files.ts";
 import { COURSE_DOCUMENT_VERSION, renderCourseMarkdown } from "./course.ts";
+import { synthesizeCourse } from "./tutorial.ts";
 
 export const MAX_MODEL_CALLS = 12;
 export class LearnService {
@@ -36,7 +37,7 @@ export class LearnService {
   /** One human-approved catalog snapshot, sequential BV/P tasks; never auto-approve generation retries. */
   async fromCourse(input: string, run: ModelRunner, approve: (course: CourseListing) => Promise<boolean | CourseOutputMode>, signal?: AbortSignal,
     progress: (message: string) => void = () => {}, approveVisual?: (source: VideoSource, reason: string) => Promise<boolean>,
-    selectScope?: (scope: CourseScope) => Promise<"current" | "collection" | false>): Promise<{ course: CourseJob; usage: ModelUsage }> {
+    selectScope?: (scope: CourseScope) => Promise<"current" | "collection" | false>, approveTutorial?: ApproveTutorial): Promise<{ course: CourseJob; usage: ModelUsage }> {
     const plan = await this.store.activePlan();
     this.checkConsent(plan);
     const session = hash((await this.store.credentials()).sessdata);
@@ -59,8 +60,8 @@ export class LearnService {
     }
     signal?.throwIfAborted();
     const approved = await approve(listing);
-    if (approved !== true && approved !== "separate" && approved !== "merged") throw new LearnError("COURSE_DECLINED", "已取消整组分 P 处理，没有下载媒体或调用整理模型。");
-    const outputMode = approved === "merged" ? "merged" : "separate";
+    if (approved !== true && approved !== "separate" && approved !== "merged" && approved !== "tutorial") throw new LearnError("COURSE_DECLINED", "已取消整组分 P 处理，没有下载媒体或调用整理模型。");
+    const outputMode = approved === "tutorial" ? "tutorial" : approved === "merged" ? "merged" : "separate";
     signal?.throwIfAborted();
     const identity = listing.origin
       ? { plan, origin: listing.origin, videos: listing.parts.map(p => [p.bvid, p.part, p.cid]), prompt: PROMPT_VERSION, session }
@@ -132,8 +133,23 @@ export class LearnService {
         }
       }
       await persist();
+      if (outputMode === "tutorial") {
+        if (job.status !== "completed") job.tutorialError = "课程素材尚未全部完成，未自动开始综合。可修复后继续课程，或用 /learn tutorial <课程ID> 明确确认部分素材综合。";
+        else if (!approveTutorial) job.tutorialError = "综合阶段需要额外的人工预算确认，没有调用综合模型。";
+        else {
+          try {
+            const result = await synthesizeCourse(this.store, job.id, run, approveTutorial, signal, progress);
+            addUsage(usage, result.usage);
+            job.tutorialJobId = result.jobId; job.tutorialDraftId = result.draftId; job.tutorialError = result.error;
+          } catch (error) { job.tutorialError = publicError(error); }
+        }
+        await persist();
+      }
       return { course: job, usage };
     });
+  }
+  async tutorial(input: string, run: ModelRunner, approve: ApproveTutorial, signal?: AbortSignal, progress?: (message: string) => void) {
+    return synthesizeCourse(this.store, input, run, approve, signal, progress);
   }
   private async mergeCourse(plan: Plan, listing: CourseListing, job: CourseJob): Promise<CourseDraft> {
     const chapters: MaterialDraft[] = [];
@@ -211,7 +227,7 @@ export class LearnService {
         for (let i = 0; i < chunks.length; i++) {
           signal?.throwIfAborted();
           progress(visual ? `正在整理第 ${i + 1}/${chunks.length} 批采样画面（不是视频全文）…` : `正在整理第 ${i + 1}/${chunks.length} 段字幕…`);
-          const request = modelPrompt(plan, material, chunks[i]!, i + 1, chunks.length);
+          const request = modelPrompt(plan, material, chunks[i]!, i + 1, chunks.length, notes);
           const images = visual ? await visualImages(this.store, material, chunks[i]!.map(segment => segment.index)) : undefined;
           const result = await run({ system: visual ? VISUAL_SYSTEM_PROMPT : SYSTEM_PROMPT, prompt: request, ...(images ? { images } : {}), signal });
           addUsage(usage, result.usage);
