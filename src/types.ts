@@ -37,6 +37,65 @@ export interface VideoSource {
   sourceUrl: string;
   duration?: number;
 }
+export interface CourseUnit extends VideoSource {
+  /** Global course chapter index; part remains the actual P within this BV. */
+  index?: number;
+  videoIndex?: number;
+  videoTitle?: string;
+}
+export interface CollectionInfo {
+  id?: number;
+  title: string;
+  bvids?: string[];
+  unavailable?: string;
+}
+export interface CourseListing {
+  bvid: string;
+  title: string;
+  parts: CourseUnit[];
+  collection?: CollectionInfo;
+  videos?: { bvid: string; title: string; index: number; parts: number }[];
+  origin?: "manual" | "season";
+  /** Oldest metadata snapshot reused during multi-video enumeration, if any. */
+  catalogCachedAt?: string;
+}
+export type CourseScope = { kind: "video"; current: CourseListing } | { kind: "manual"; bvids: string[] };
+export const courseUnitIndex = (unit: CourseUnit): number => unit.index ?? unit.part;
+export const courseUnitLabel = (unit: CourseUnit): string => unit.videoIndex === undefined ? `P${unit.part}` : `视频${unit.videoIndex} ${unit.bvid} / P${unit.part}`;
+export interface CoursePartResult {
+  /** Global chapter index; legacy single-BV records use the P number. */
+  part: number;
+  bvid?: string;
+  sourcePart?: number;
+  videoIndex?: number;
+  cid: number;
+  title: string;
+  draftId: string;
+  visual: boolean;
+  reused: boolean;
+}
+export type CourseOutputMode = "separate" | "merged";
+export interface CourseJob {
+  id: string;
+  kind: "course";
+  planId: string;
+  planRevision: number;
+  bvid: string;
+  title: string;
+  total: number;
+  inputs?: string[];
+  origin?: "manual" | "season";
+  stoppedLabel?: string;
+  status: "running" | "completed" | "stopped" | "cancelled";
+  completed: CoursePartResult[];
+  /** Missing on records created before output-mode selection was introduced. */
+  outputMode?: CourseOutputMode;
+  mergedDraftId?: string;
+  mergeError?: string;
+  stoppedPart?: number;
+  error?: string;
+  at: string;
+}
 export interface VisualAssets {
   /** Directory name under the private materials bucket, never an arbitrary path. */
   directory: string;
@@ -90,7 +149,8 @@ export interface ModelUsage {
 export interface ModelRequest {
   system: string;
   prompt: string;
-  maxTokens: number;
+  /** Omit to use the host model's output limit, bounded by available context. */
+  maxTokens?: number;
   images?: { data: string; mimeType: "image/jpeg" }[];
   signal?: AbortSignal;
 }
@@ -104,18 +164,28 @@ export type ModelRunner = ((request: ModelRequest) => Promise<ModelResult>) & {
   maxImagesPerRequest?: number;
 };
 
-export interface Draft {
+interface DraftBase {
   schemaVersion: 1;
   id: string;
   planId: string;
   planRevision: number;
-  materialId: string;
   title: string;
   markdown: string;
   createdAt: string;
   usage: ModelUsage;
   publishedPaths: string[];
 }
+
+export interface MaterialDraft extends DraftBase {
+  /** Omitted on legacy single-material drafts. */
+  kind?: "material";
+  materialId: string;
+}
+export interface CourseDraft extends DraftBase {
+  kind: "course";
+  course: { jobId: string; bvid: string; total: number; parts: CoursePartResult[] };
+}
+export type Draft = MaterialDraft | CourseDraft;
 
 export interface Credentials {
   sessdata: string;

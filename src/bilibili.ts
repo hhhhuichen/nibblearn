@@ -2,7 +2,7 @@ import { createTrafficGuard } from "../vendor/dsh-bili-whale/traffic.mjs";
 import { signWbi } from "../vendor/dsh-bili-whale/sign-wbi.mjs";
 import { hash, object, text, validateSegments } from "./validate.ts";
 import { LearnError } from "./types.ts";
-import type { Credentials, Material, VideoSource } from "./types.ts";
+import type { CollectionInfo, CourseListing, Credentials, Material, VideoSource } from "./types.ts";
 import { Store } from "./store.ts";
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
@@ -28,6 +28,41 @@ export function parseVideo(input: string): { bvid: string; part: number; url: st
   const p = url.searchParams.get("p") ?? "1";
   if (!match || !/^[1-9][0-9]*$/.test(p) || Number(p) > 10000) throw new LearnError("INVALID_VIDEO", "视频路径或分 P 参数无效。");
   return { bvid: match[1]!, part: Number(p), url: `https://www.bilibili.com/video/${match[1]}/?p=${p}` };
+}
+export const MAX_COURSE_VIDEOS = 100;
+/** Explicit whitespace-separated links/BVs only; deduplicate by BV, preserving user order. */
+export function parseCourseInputs(input: string): string[] {
+  if (input.length > 32000) throw new LearnError("COURSE_INPUT_TOO_LARGE", "课程链接列表超过 32,000 字符，请分组处理。");
+  const tokens = input.trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length) throw new LearnError("INVALID_VIDEO", "请提供视频链接或 BV 号；多个链接用空格或换行分隔。");
+  const bvids = [...new Set(tokens.map(value => parseVideo(value).bvid))];
+  if (bvids.length > MAX_COURSE_VIDEOS) throw new LearnError("COURSE_TOO_LARGE", `单次课程最多 ${MAX_COURSE_VIDEOS} 个独立 BV，请显式分组；没有截取前一部分冒充全部。`);
+  return bvids;
+}
+function collectionInfo(view: Record<string, unknown>, seed: string): CollectionInfo | undefined {
+  if (view.ugc_season === undefined || view.ugc_season === null) return undefined;
+  try {
+    const season = object(view.ugc_season), id = Number(season.id), count = Number(season.ep_count);
+    const title = text(season.title, "合集标题", 1000);
+    if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(count) || count < 1 || count > 10000
+      || !Array.isArray(season.sections) || !season.sections.length) throw new Error("incomplete");
+    const episodes = season.sections.flatMap(value => {
+      const section = object(value);
+      if (!Array.isArray(section.episodes) || (section.season_id !== undefined && Number(section.season_id) !== id)) throw new Error("incomplete");
+      return section.episodes.map(object);
+    });
+    if (episodes.length !== count || episodes.some(episode => episode.season_id !== undefined && Number(episode.season_id) !== id)) throw new Error("incomplete");
+    const bvids = [...new Set(episodes.map(episode => {
+      const raw = episode.bvid ?? object(episode.arc ?? {}).bvid;
+      if (typeof raw !== "string" || !/^BV[a-zA-Z0-9]{10}$/.test(raw)) throw new Error("incomplete");
+      return raw;
+    }))];
+    if (!bvids.includes(seed)) throw new Error("incomplete");
+    if (bvids.length > MAX_COURSE_VIDEOS) return { id, title, unavailable: `合集超过单次 ${MAX_COURSE_VIDEOS} 个 BV 上限，请显式提供分组链接。` };
+    return { id, title, bvids };
+  } catch {
+    return { title: "检测到投稿合集", unavailable: "平台返回的合集列表缺失、数量不符或条目标识不完整，不能确认全部范围；可只处理当前 BV，或显式提供多个视频链接。" };
+  }
 }
 export function publicContentHeaders(referer: string): Record<string, string> {
   return { "user-agent": USER_AGENT, referer };
@@ -112,12 +147,71 @@ export class BilibiliProvider {
     const images = object(nav.wbi_img);
     return { img_url: text(images.img_url, "签名材料"), sub_url: text(images.sub_url, "签名材料") };
   }
-  async load(input: string, language: string, signal?: AbortSignal): Promise<Material> {
+  /** Enumerate this BV's pages; attached UGC-season metadata is only a candidate, never auto-expanded. */
+  async course(input: string, signal?: AbortSignal): Promise<CourseListing> {
+    const { bvid } = parseVideo(input);
+    const credentials = await this.store.credentials();
+    const images = await this.signingImages(credentials, signal);
+    const view = await this.api("/x/web-interface/wbi/view", signWbi({ bvid }, images), credentials, signal);
+    if (!Array.isArray(view.pages) || !view.pages.length || view.pages.length > 10000) {
+      throw new LearnError("UPSTREAM_ERROR", "平台没有返回有效的完整分 P 列表，未猜测或截断课程范围。");
+    }
+    const title = text(view.title, "视频标题", 1000);
+    const author = text(object(view.owner).name, "作者", 300);
+    const aid = Number(view.aid), cids = new Set<number>();
+    const parts = view.pages.map((value, index): VideoSource => {
+      const page = object(value), cid = Number(page.cid), duration = Number(page.duration);
+      if (!Number.isSafeInteger(cid) || cid < 1 || cids.has(cid)
+        || (page.page !== undefined && Number(page.page) !== index + 1)) {
+        throw new LearnError("UPSTREAM_ERROR", "分 P 标识重复、缺失或顺序异常，已停止课程读取。");
+      }
+      cids.add(cid);
+      return { bvid, cid, part: index + 1, title: `${title} · P${index + 1} ${text(page.part ?? `P${index + 1}`, "分 P 标题", 1000)}`, author,
+        sourceUrl: `https://www.bilibili.com/video/${bvid}/?p=${index + 1}`,
+        ...(Number.isSafeInteger(aid) && aid > 0 ? { aid } : {}),
+        ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}) };
+    });
+    const collection = collectionInfo(view, bvid);
+    return { bvid, title, parts, ...(collection ? { collection } : {}) };
+  }
+  /** Enumerate a fixed, explicitly chosen BV list. Never recursively follow their collections. */
+  async combineCourses(bvids: string[], origin: "manual" | "season", title: string, signal?: AbortSignal, seed?: CourseListing): Promise<CourseListing> {
+    const selected = parseCourseInputs(bvids.join(" "));
+    const parts: CourseListing["parts"] = [], videos: NonNullable<CourseListing["videos"]> = [];
+    const session = hash((await this.store.credentials()).sessdata);
+    let oldestCache: number | undefined;
+    for (const [index, bvid] of selected.entries()) {
+      signal?.throwIfAborted();
+      const key = `course-meta-${hash([bvid, session])}`;
+      const cached = await this.store.read<{ at: number; listing: CourseListing }>("jobs", key);
+      const reusable = cached && cached.at <= Date.now() && Date.now() - cached.at < 86400000
+        && cached.listing?.bvid === bvid && Array.isArray(cached.listing.parts) && cached.listing.parts.length > 0
+        && cached.listing.parts.every((part, i) => part.bvid === bvid && part.part === i + 1 && Number.isSafeInteger(part.cid) && part.cid > 0
+          && part.sourceUrl === `https://www.bilibili.com/video/${bvid}/?p=${i + 1}`);
+      const video = seed?.bvid === bvid ? seed : reusable ? cached.listing : await this.course(bvid, signal);
+      if (hash((await this.store.credentials()).sessdata) !== session) throw new LearnError("ACCOUNT_CHANGED", "枚举课程目录时登录凭据发生变化，已停止，请重新确认。");
+      if (parts.length + video.parts.length > 10000) throw new LearnError("COURSE_TOO_LARGE", "课程总分 P 数超过 10,000，未截断列表或启动模型整理。");
+      if (seed?.bvid !== bvid && reusable) oldestCache = Math.min(oldestCache ?? cached.at, cached.at);
+      else {
+        const snapshot = { at: Date.now(), listing: { bvid: video.bvid, title: video.title, parts: video.parts } };
+        if (Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= 6 * 1024 * 1024) await this.store.write("jobs", key, snapshot);
+      }
+      videos.push({ bvid, title: video.title, index: index + 1, parts: video.parts.length });
+      for (const part of video.parts) parts.push({ ...part, index: parts.length + 1, videoIndex: index + 1, videoTitle: video.title });
+    }
+    return { bvid: selected[0]!, title, parts, videos, origin,
+      ...(oldestCache !== undefined ? { catalogCachedAt: new Date(oldestCache).toISOString() } : {}) };
+  }
+  async load(input: string, language: string, signal?: AbortSignal, expectedCid?: number): Promise<Material> {
     const video = parseVideo(input);
     const c = await this.store.credentials();
     const cacheId = `source-${hash([video.bvid, video.part, language, hash(c.sessdata)])}`;
     const cached = await this.store.read<{ materialId: string; at: number }>("jobs", cacheId);
-    if (cached && Date.now() - cached.at < 24 * 3600_000) return this.store.material(cached.materialId);
+    if (cached && Date.now() - cached.at < 24 * 3600_000) {
+      const material = await this.store.material(cached.materialId);
+      if (expectedCid === undefined || (material.cid === expectedCid && material.bvid === video.bvid && material.part === video.part)) return material;
+      // A replaced/reordered page must not reuse a cache belonging to another cid.
+    }
     const images = await this.signingImages(c, signal);
     const view = await this.api("/x/web-interface/wbi/view", signWbi({ bvid: video.bvid }, images), c, signal);
     const pages = Array.isArray(view.pages) ? view.pages.map(object) : [{ cid: view.cid, duration: view.duration }];
@@ -125,6 +219,7 @@ export class BilibiliProvider {
     if (!page) throw new LearnError("INVALID_PART", `视频只有 ${pages.length} 个分 P，请检查链接中的 p 参数。`);
     const cid = Number(page.cid);
     if (!Number.isSafeInteger(cid) || cid < 1) throw new LearnError("UPSTREAM_ERROR", "平台未返回有效的分 P 标识。");
+    if (expectedCid !== undefined && cid !== expectedCid) throw new LearnError("COURSE_CHANGED", "课程分 P 在确认后发生变化，已停止；请重新运行 /learn course 确认范围。");
     const duration = Number(page.duration ?? view.duration), aid = Number(view.aid);
     const source: VideoSource = {
       bvid: video.bvid, cid, part: video.part, sourceUrl: video.url,

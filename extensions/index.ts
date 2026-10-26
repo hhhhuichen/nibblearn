@@ -1,16 +1,16 @@
 import path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BilibiliProvider, parseVideo } from "../src/bilibili.ts";
+import { BilibiliProvider, parseCourseInputs, parseVideo } from "../src/bilibili.ts";
 import { availableBrowsers, BilibiliAccount } from "../src/account/index.ts";
 import type { BrowserKind } from "../src/account/index.ts";
 import { ensureDirectory, expandPath, readText } from "../src/files.ts";
 import { Store } from "../src/store.ts";
-import { LearnService } from "../src/service.ts";
+import { LearnService, MAX_MODEL_CALLS } from "../src/service.ts";
 import { importSubtitle } from "../src/subtitles.ts";
 import { findFfmpeg } from "../src/media.ts";
-import { LearnError, ModelRunError, publicError } from "../src/types.ts";
-import type { Draft, ModelRunner, Plan } from "../src/types.ts";
+import { courseUnitLabel, LearnError, ModelRunError, publicError } from "../src/types.ts";
+import type { CourseJob, CourseOutputMode, CourseScope, Draft, ModelRunner, Plan, VideoSource } from "../src/types.ts";
 import { hash, parseJson, validatePlan } from "../src/validate.ts";
 
 const HELP = `# Nibblearn
@@ -19,7 +19,8 @@ const HELP = `# Nibblearn
 - plans / use <ID>：选择学习计划
 - config：编辑当前计划（修改会产生新版本）
 - auth：选择 Edge/Chrome，在专用窗口登录 Bilibili，回到 pi 检查并确认账号；无需复制 Cookie
-- video <BV号或完整链接>：优先读取主/备用字幕；无字幕时可人工确认采样画面，只生成草稿
+- video <BV号或完整链接>：只处理指定分 P（默认 P1），优先字幕；无字幕时可确认采样画面
+- course <一个或多个BV号/链接>：可选当前视频、投稿合集或多链接组课，确认范围后处理所有分 P；支持分别/合并成文
 - import <字幕文件路径>：导入 SRT/VTT/JSON 后生成草稿，不必登录 Bilibili
 - reference <文本文件路径>：添加用户提供的参考材料（.md/.txt，最多8000字符）
 - review [草稿ID] / save [草稿ID]：预览、编辑，确认后保存；绝不覆盖已有文件
@@ -44,11 +45,20 @@ function modelRunner(ctx: ExtensionContext): ModelRunner {
     const images = request.images ?? [];
     if (images.length && !model.input.includes("image")) throw new LearnError("VISION_MODEL_REQUIRED", "当前模型不支持图片输入，请通过 /model 切换看图模型。");
     if (images.length > imageLimit) throw new LearnError("VISION_MODEL_LIMIT", "图片数量超过当前模型的单次上限，没有静默丢弃画面。");
-    const maxTokens = Math.min(request.maxTokens, model.maxTokens || request.maxTokens);
-    // Text bytes overestimate tokens; reserve 8192/image, a conservative heuristic, not provider billing.
-    if (Buffer.byteLength(request.system + request.prompt, "utf8") + images.length * 8192 + maxTokens + 1024 > model.contextWindow) {
+    if (!Number.isSafeInteger(model.maxTokens) || model.maxTokens <= 0
+      || !Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0) {
+      throw new LearnError("MODEL_LIMITS", "当前模型未声明有效的最大输出量或上下文窗口，请检查 pi 模型配置；没有猜测额度或发起请求。");
+    }
+    if (request.maxTokens !== undefined && (!Number.isSafeInteger(request.maxTokens) || request.maxTokens <= 0)) {
+      throw new LearnError("MODEL_LIMITS", "请求的输出上限必须是正整数。");
+    }
+    // Conservative estimate, not exact tokenization or billing; images vary by provider.
+    const inputBudget = Buffer.byteLength(request.system + request.prompt, "utf8") + images.length * 8192 + 1024;
+    const availableOutput = model.contextWindow - inputBudget;
+    if (availableOutput < 1) {
       throw new LearnError("MODEL_CONTEXT", "当前模型上下文不足，请选择更大上下文模型、减少参考资料或拆分字幕；未截断材料。");
     }
+    const maxTokens = Math.min(request.maxTokens ?? model.maxTokens, model.maxTokens, availableOutput);
     const content = [{ type: "text" as const, text: request.prompt }, ...images.map(image => ({ type: "image" as const, ...image }))];
     const context = { systemPrompt: request.system, messages: [{ role: "user" as const, content, timestamp: Date.now() }] };
     if (model.inputLimits?.maxRequestBytes && Buffer.byteLength(JSON.stringify(context), "utf8") + 4096 > model.inputLimits.maxRequestBytes) {
@@ -102,6 +112,30 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
       await Promise.allSettled([...workTasks, ...[...accounts].map(account => account.close())]);
     });
 
+    const visualApproval = (ctx: ExtensionContext, run: ModelRunner, signal: AbortSignal) => async (source: VideoSource, reason: string) => {
+      requireUI(ctx);
+      await findFfmpeg();
+      return ctx.ui.confirm("没有可用字幕，改用采样画面？", `${reason}\n\n视频：${source.title}\n分 P：${source.part}；时长：${source.duration ?? "未知"} 秒\n\n将下载当前可访问的视频流（最多 256 MiB），在全程最多采样 ${MAX_MODEL_CALLS * Math.min(2, run.maxImagesPerRequest ?? 2)} 个时间点，读取画面及底部硬字幕。图片会发送给当前模型，最多 ${MAX_MODEL_CALLS} 次整理请求并消耗额度。\n\n不会处理音频、读取评论或绕过访问限制。这只能生成采样画面概要，可能漏掉重要讲解，不是视频全文。只处理你有权访问的内容；图片可能包含视频中可见的个人信息，请确认允许发送。临时视频会删除，画面保存在本机缓存供复用。是否同意？`, { signal });
+    };
+    const chooseCourseScope = (ctx: ExtensionContext, signal: AbortSignal) => async (scope: CourseScope): Promise<"current" | "collection" | false> => {
+      if (scope.kind === "manual") {
+        return await ctx.ui.confirm("按这些链接组课？", `共 ${scope.bvids.length} 个不同 BV，按提供顺序处理，每个 BV 将包含全部分 P；重复 BV 已去重，链接中的 p 不限定课程范围。\n${scope.bvids.join("\n")}\n\n下一步只读取这些视频的目录信息，不递归扩展各自所属合集；获取完整数量后还会确认输出方式和累计模型用量。是否读取目录？`, { signal }) === true ? "collection" : false;
+      }
+      const collection = scope.current.collection!;
+      const currentLabel = `仅当前视频：${scope.current.parts.length} 个分 P`;
+      const collectionLabel = `整个投稿合集：${collection.title}（${collection.bvids?.length ?? 0} 个独立视频，每个视频包含全部分 P）`;
+      if (collection.unavailable) ctx.ui.notify(collection.unavailable, "warning");
+      const options = collection.bvids && !collection.unavailable ? [collectionLabel, currentLabel] : [currentLabel];
+      const selected = await ctx.ui.select("选择课程范围；取消则停止", options, { signal });
+      return selected === currentLabel ? "current" : options.includes(collectionLabel) && selected === collectionLabel ? "collection" : false;
+    };
+    const courseStatuses = async (store: Store, plan: Plan) => (await store.list<CourseJob>("jobs"))
+      .filter(job => job.kind === "course" && job.planId === plan.id)
+      .sort((a, b) => b.at.localeCompare(a.at)).slice(0, 10)
+      .map(job => ({ id: job.id, bvid: job.bvid, title: job.title, revision: job.planRevision, status: job.status,
+        completed: job.completed.length, total: job.total, stoppedPart: job.stoppedPart, error: job.error,
+        outputMode: job.outputMode ?? "separate", mergedDraftId: job.mergedDraftId, mergeError: job.mergeError,
+        inputs: job.inputs, origin: job.origin, stoppedLabel: job.stoppedLabel }));
     const toolOutput = Type.Object({ draftId: Type.String(), title: Type.String(), reused: Type.Boolean() });
     const generateTool = (kind: "video" | "material") => {
       pi.registerTool({
@@ -121,11 +155,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
           const run = modelRunner(ctx);
           const result = await work(signal, async signal => {
             const progress = (message: string) => onUpdate?.({ content: [{ type: "text", text: message }], details: undefined });
-            if (kind === "video") return svc.fromVideo(params.input, run, signal, progress, async (source, reason) => {
-              requireUI(ctx);
-              await findFfmpeg();
-              return ctx.ui.confirm("没有可用字幕，改用采样画面？", `${reason}\n\n视频：${source.title}\n分 P：${source.part}；时长：${source.duration ?? "未知"} 秒\n\n将下载当前可访问的视频流（最多 256 MiB），在全程最多采样 ${12 * Math.min(2, run.maxImagesPerRequest ?? 2)} 个时间点，读取画面及底部硬字幕。图片会发送给当前模型，最多 12 次整理请求并消耗额度。\n\n不会处理音频、读取评论或绕过访问限制。这只能生成采样画面概要，可能漏掉重要讲解，不是视频全文。只处理你有权访问的内容；图片可能包含视频中可见的个人信息，请确认允许发送。临时视频会删除，画面保存在本机缓存供复用。是否同意？`, { signal });
-            });
+            if (kind === "video") return svc.fromVideo(params.input, run, signal, progress, visualApproval(ctx, run, signal));
             const material = await svc.store.material(params.input);
             if (material.kind === "bilibili-visual") {
               requireUI(ctx);
@@ -145,6 +175,41 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
     generateTool("video");
     generateTool("material");
     pi.registerTool({
+      name: "learn_course", label: "学习课程与合集",
+      description: "支持单 BV 全部分 P、明确选择的投稿合集，或空格/换行分隔的多个视频链接组课。由用户选择范围与分别/合并成文，确认累计用量后顺序生成讲义；不递归扩展推荐、作者投稿、收藏夹，不处理不完整合集列表。中断保留进度，不自动重试或发布。",
+      promptSnippet: "用户要处理全部分 P、投稿合集或多个视频时使用 learn_course，不要自行循环调用 learn_video。",
+      promptGuidelines: ["整组处理必须经工具内用户对话框批准；停止后不得自动再次调用或用单 P 工具绕过。", "分别报告字幕讲义与采样画面，不能声称完整观看；保存须由用户运行 /learn review 确认。"],
+      parameters: Type.Object({ input: Type.String({ description: "一个或多个BV号/完整HTTPS视频链接，空格或换行分隔；通过用户对话框选择合集范围，每个选中BV处理全部P" }) }),
+      executionMode: "sequential",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      async execute(_id, params, signal, onUpdate, ctx) {
+        requireUI(ctx);
+        const svc = service(), run = modelRunner(ctx);
+        const result = await work(signal, signal => svc.fromCourse(params.input, run, async listing => {
+          const mergedLabel = "合并成文：按视频与 P 顺序编为一份讲义（无额外模型请求）";
+          const separateLabel = "分别成文：每个视频分 P 一份讲义";
+          const videoCount = listing.videos?.length ?? 1;
+          const selected = await ctx.ui.select(`${listing.title}（${videoCount} 个视频，${listing.parts.length} 个分 P）：选择输出方式`, [mergedLabel, separateLabel], { signal });
+          if (selected !== mergedLabel && selected !== separateLabel) return false;
+          const mode: CourseOutputMode = selected === mergedLabel ? "merged" : "separate";
+          const duration = listing.parts.every(p => p.duration !== undefined)
+            ? `总时长约 ${Math.ceil(listing.parts.reduce((sum, p) => sum + p.duration!, 0) / 60)} 分钟` : "部分分 P 时长未知";
+          const preview = listing.parts.slice(0, 20).map(p => `${courseUnitLabel(p)}：${p.title}`).join("\n");
+          const confirmed = await ctx.ui.confirm("处理已选课程的全部内容？", `${listing.title}\n共 ${videoCount} 个视频、${listing.parts.length} 个分 P；${duration}。${listing.catalogCachedAt ? `\n部分视频目录复用 24 小时内缓存（最早 ${listing.catalogCachedAt}），近期新增 P 可能尚未体现，处理范围以本次确认列表为准。` : ""}\n${preview}${listing.parts.length > 20 ? "\n…其余分 P 也在处理范围内。" : ""}\n\n忽略链接中的 p 选择，按所确认的视频顺序，从各自 P1 处理全部 ${listing.parts.length} 个分 P。合集按平台分区与条目顺序排列；手动组课按输入顺序排列。每 P 最多 ${MAX_MODEL_CALLS} 次整理请求，整组理论最多 ${listing.parts.length * MAX_MODEL_CALLS} 次，不是整组只调用 12 次；单次输出采用当前模型上限，可能产生较多费用和等待。\n\n已完成且匹配当前计划、材料和生成规则的课程进度会复用；未完成的 P 才继续处理。无字幕时另行确认画面上传；拒绝或任何错误都会停止，不自动跳过、重试或绕过平台限流。\n\n输出方式：${mode === "merged" ? "按视频与 P 顺序合并为一份讲义，统一审核保存；各 P 中间草稿保留供复用。中途停止时仅收录已完成章节，并明确列出缺少的 P。" : "每 P 一份讲义，分别审核保存。"}两种方式都不额外调用模型做跨 P 去重或综合，不声称完整观看视频。可用 /learn cancel 停止，已完成草稿保留，需 /learn review 审核保存。是否开始？`, { signal });
+          return confirmed === true ? mode : false;
+        }, signal, message => onUpdate?.({ content: [{ type: "text", text: message }], details: undefined }), visualApproval(ctx, run, signal), chooseCourseScope(ctx, signal)));
+        const job = result.course;
+        const details = { courseId: job.id, bvid: job.bvid, status: job.status, total: job.total,
+          completed: job.completed, stoppedPart: job.stoppedPart, error: job.error,
+          outputMode: job.outputMode, mergedDraftId: job.mergedDraftId, mergeError: job.mergeError,
+          inputs: job.inputs, origin: job.origin, stoppedLabel: job.stoppedLabel };
+        const output = job.outputMode === "merged"
+          ? (job.mergedDraftId ? `已编排${job.completed.length < job.total ? "部分" : "完整分 P 列表的"}合并稿：${job.mergedDraftId}\n运行 /learn review ${job.mergedDraftId}，一次审核保存为一份文档。` : `尚未生成合并稿。${job.mergeError ?? "没有已完成章节。"}`)
+          : "每 P 分别成文，运行 /learn review <草稿ID> 审核保存。";
+        return { content: [{ type: "text", text: `${job.status === "completed" ? "全部分 P 处理完成" : "分 P 批量处理已停止"}：${job.title}\n本次确认完成 ${job.completed.length}/${job.total} 个 P。\n${job.completed.map(p => `${p.bvid ? `视频${p.videoIndex} ${p.bvid} / P${p.sourcePart}` : `P${p.part}`}：${p.visual ? "采样画面（无声音，非全文）" : "字幕讲义"}${p.reused ? "，已复用" : ""}${job.outputMode === "merged" && job.mergedDraftId ? "" : `；草稿 ${p.draftId}`}`).join("\n")}\n${job.error ? `停止于 ${job.stoppedLabel ?? `P${job.stoppedPart}`}：${job.error}\n未处理的分 P 不代表已学习。修复问题后由用户再次运行 /learn course ${job.origin === "manual" ? job.inputs!.join(" ") : job.bvid}；失败生成仍须 /learn retry 人工确认。\n` : ""}${output}\n合并仅为本机章节编排，没有跨 P 去重或综合，不额外消耗模型额度。未自动发布。` }], details, usage: result.usage };
+      },
+    });
+    pi.registerTool({
       name: "learn_status", label: "学习计划状态", description: "查看用户已创建的当前学习计划和草稿ID，不含账号凭据。",
       parameters: Type.Object({}), annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       async execute() {
@@ -154,7 +219,8 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
         const jobs = (await store.list<Record<string, unknown>>("jobs")).filter(j => j.kind === "generation" && j.planId === plan.id && ["running", "failed", "cancelled"].includes(String(j.status)));
         const details = { plan: { id: plan.id, title: plan.title, topic: plan.topic, goal: plan.goal, revision: plan.revision },
           drafts: drafts.map(d => ({ id: d.id, title: d.title, createdAt: d.createdAt, published: d.publishedPaths.length > 0 })),
-          unfinishedJobs: jobs.slice(-10).map(j => ({ id: j.id, status: j.status, errorCode: j.errorCode })) };
+          unfinishedJobs: jobs.slice(-10).map(j => ({ id: j.id, status: j.status, errorCode: j.errorCode })),
+          courses: await courseStatuses(store, plan) };
         return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
       },
     });
@@ -293,9 +359,9 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
     }
 
     pi.registerCommand("learn", {
-      description: "Nibblearn：学习计划与视频材料笔记，setup / auth / video / import / review",
+      description: "Nibblearn：学习计划与视频材料笔记，setup / auth / video / course / import / review",
       getArgumentCompletions(prefix) {
-        return ["setup", "plans", "use", "config", "auth", "video", "import", "reference", "review", "save", "status", "retry", "resume", "cancel"]
+        return ["setup", "plans", "use", "config", "auth", "video", "course", "import", "reference", "review", "save", "status", "retry", "resume", "cancel"]
           .filter(value => value.startsWith(prefix)).map(value => ({ value, label: value }));
       },
       async handler(args, ctx) {
@@ -346,10 +412,10 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
             await store.savePlan({ ...plan, references: [...plan.references.filter(r => r.id !== reference.id), reference] });
             report("参考材料已添加，计划版本已更新。此操作没有检索网页，也没有认证资料权威性。"); return;
           }
-          if (command === "video") {
+          if (command === "video" || command === "course") {
             const plan = await store.activePlan(); service().checkConsent(plan);
-            const video = parseVideo(argument);
-            pi.sendUserMessage(`请仅调用 learn_video 工具生成草稿，input=${JSON.stringify(video.url)}。完成后告知 /learn review，不要用 write 等工具发布或访问凭据。`, { deliverAs: "followUp" });
+            const input = command === "course" ? parseCourseInputs(argument).join(" ") : parseVideo(argument).url;
+            pi.sendUserMessage(`请仅调用 ${command === "course" ? "learn_course" : "learn_video"} 工具生成草稿，input=${JSON.stringify(input)}。${command === "course" ? "通过工具内对话框确认当前视频、投稿合集或多链接范围；停止后不要自动重试或改用单 P 工具继续。" : ""}完成后告知 /learn review，不要用 write 等工具发布或访问凭据。`, { deliverAs: "followUp" });
             return;
           }
           if (command === "import") {
@@ -365,6 +431,8 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
             const plan = await store.activePlan();
             const drafts = (await store.list<Draft>("drafts")).filter(d => d.planId === plan.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 10);
             const jobs = (await store.list<Record<string, unknown>>("jobs")).filter(j => j.kind === "generation" && j.planId === plan.id && ["running", "failed", "cancelled"].includes(String(j.status)));
+            const courses = await courseStatuses(store, plan);
+            if (courses.length) report(`分 P 课程进度（running 也可能是上次退出遗留，不代表正在执行）：\n${courses.map(c => `- ${c.bvid}：${c.completed}/${c.total}，${c.status}${c.stoppedPart ? `，停止于 ${c.stoppedLabel ?? `P${c.stoppedPart}`}` : ""}${c.error ? `；${c.error}` : ""}${c.mergedDraftId ? `；合并稿 ${c.mergedDraftId}` : ""}${c.mergeError ? `；合并失败：${c.mergeError}` : ""}${c.origin === "manual" ? `；继续输入：/learn course ${c.inputs!.join(" ")}` : ""}`).join("\n")}\n由用户运行 /learn course <BV号或多个链接> 确认后继续；已完成项可复用。`);
             report(`当前计划：${plan.title}（${plan.id}，v${plan.revision}）\n主题：${plan.topic}\n目标：${plan.goal}\n保存目录：${plan.outputDir}\n本插件凭据：${await store.hasCredentials() ? "已配置（未在线验证）" : "未配置，可先导入字幕"}\n\n最近草稿：\n${drafts.map(d => `- ${d.id}：${d.title}${d.publishedPaths.length ? "（已保存）" : "（待审核）"}`).join("\n") || "暂无"}\n\n未完成任务（需 /learn retry 人工重试）：\n${jobs.slice(-10).map(j => `- ${j.id}：${j.status} ${j.errorCode ?? ""}`).join("\n") || "暂无"}`);
             return;
           }
