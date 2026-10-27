@@ -10,8 +10,11 @@ import { LearnService, MAX_MODEL_CALLS } from "../src/service.ts";
 import { importSubtitle } from "../src/subtitles.ts";
 import { findFfmpeg } from "../src/media.ts";
 import { MAX_TUTORIAL_CALLS, MAX_TUTORIAL_CHAPTERS } from "../src/tutorial.ts";
+import { generatePractice } from "../src/practice.ts";
+import { acknowledgeReviewFile, openReviewFile, prepareReviewFile, readReviewFile } from "../src/review.ts";
+import type { ReviewFile } from "../src/review.ts";
 import { courseUnitLabel, LearnError, ModelRunError, publicError } from "../src/types.ts";
-import type { CourseJob, CourseOutputMode, CourseScope, ApproveTutorial, Draft, ModelRunner, Plan, VideoSource } from "../src/types.ts";
+import type { CourseJob, CourseOutputMode, CourseScope, ApproveTutorial, Draft, ModelRunner, Plan, PracticeMode, VideoSource } from "../src/types.ts";
 import { hash, parseJson, validatePlan } from "../src/validate.ts";
 
 const HELP = `# Nibblearn
@@ -22,16 +25,18 @@ const HELP = `# Nibblearn
 - auth：选择 Edge/Chrome，在专用窗口登录 Bilibili，回到 pi 检查并确认账号；无需复制 Cookie
 - video <BV号或完整链接>：只处理指定分 P（默认 P1），优先字幕；无字幕时可确认采样画面
 - course <一个或多个BV号/链接>：选定范围后处理所有 P；可分别成文、资料合并或额外确认后重编综合教程
-- tutorial <课程ID或合并稿ID>：仅用已有草稿进行跨视频选材、去重和重编；不下载视频，额外用量需确认
+- tutorial <课程ID或合并稿ID>：仅用已有草稿进行跨视频选材、去重和重编正文；不下载视频，额外用量需确认
+- practice <正文草稿ID>：可选生成自测题与答案、复习清单或两者；单独确认用量，另存草稿，不修改正文
 - import <字幕文件路径>：导入 SRT/VTT/JSON 后生成草稿，不必登录 Bilibili
 - reference <文本文件路径>：添加用户提供的参考材料（.md/.txt，最多8000字符）
-- review [草稿ID] / save [草稿ID]：预览、编辑，确认后保存；绝不覆盖已有文件
+- review [草稿ID] / save [草稿ID]：选择外部应用/文件路径/终端审核；外部编辑保存后回到 pi 确认，绝不自动发布或覆盖成品
 - status：查看计划、最近草稿与失败任务
 - retry <任务ID>：人工确认后重试失败或中断任务
 - resume：人工处理登录/验证码后解除本地账号暂停，不绕过平台退避
 - cancel：取消本插件正在执行的任务
 
 使用 pi 当前模型和认证。字幕、学习目标、参考材料会发送给该模型服务；画面兜底另需确认上传图片。
+新生成的讲义/教程先写正文，不默认生成课后自测或复习清单；需要时由用户另行运行 practice。
 画面兜底需要已安装的 FFmpeg 和看图模型，只整理离散采样，不代表完整观看或听过视频，无内置语音转写。
 不自动评论、私信、点赞或在浏览器播放视频。`;
 
@@ -134,7 +139,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
     const tutorialApproval = (ctx: ExtensionContext): ApproveTutorial => async (summary, signal) => {
       requireUI(ctx);
       if (summary.stage === "outline") return ctx.ui.confirm("确认教程学习路线后继续？", `${summary.chapters!.map((title, i) => `${i + 1}. ${title}`).join("\n")}\n\n取舍说明：\n${summary.omitted?.map(item => `- ${item.count} 个素材块：${item.reason}`).join("\n") || "没有声明省略项"}\n\n还需最多 ${summary.maxNewCalls} 次章节编写请求。已有 ${summary.completedChapters} 章会复用；不是逐视频拼接，也不是事实核验。取消会保留已付费用量和规划，稍后可人工确认继续。`, { signal });
-      return ctx.ui.confirm(summary.resuming ? "确认继续未完成的教程综合？" : "确认额外模型用量，重编综合教程？", `${summary.title}\n已有 ${summary.sourceParts}/${summary.totalParts} 个 P，提取 ${summary.units} 个知识/补充/限制素材块。\n其中 ${summary.visualSourceParts} 个 P 仅有旧稿画面描述；${summary.excludedSupplementBlocks} 个旧稿补充块因当前计划未允许模型补充而未采用。${summary.sourceParts < summary.totalParts ? "\n注意：素材未齐，只能生成部分素材教程。" : ""}\n\n新增请求最多 ${summary.maxNewCalls} 次（首次最多1次规划及${MAX_TUTORIAL_CHAPTERS}次章节编写），单次输出采用当前模型上限，可能增加费用与等待。\n\n仅发送既有草稿的正文、限制说明及当前计划允许的参考材料；不发送整份长引文索引、账号凭据、保存目录或会话历史，不重传图片/音频、不重新下载视频。旧模型笔记不是已核验事实，画面材料的缺口仍会保留。\n\n${summary.resuming ? `此前已完成 ${summary.completedChapters} 章，只继续未完成章节；失败请求可能已收费，累计用量保留。本次确认也代表同意重新尝试失败步骤。` : "规划完成后还会让你确认章节与取舍，再开始写正文。"}\n\n任务ID：${summary.jobId}\n原稿不会覆盖，成品仍须 /learn review 审核保存。是否继续？`, { signal });
+      return ctx.ui.confirm(summary.resuming ? "确认继续未完成的教程综合？" : "确认额外模型用量，重编综合教程？", `${summary.title}\n已有 ${summary.sourceParts}/${summary.totalParts} 个 P，提取 ${summary.units} 个知识/补充/限制素材块。\n其中 ${summary.visualSourceParts} 个 P 仅有旧稿画面描述；${summary.excludedSupplementBlocks} 个旧稿补充块因当前计划未允许模型补充而未采用。${summary.sourceParts < summary.totalParts ? "\n注意：素材未齐，只能生成部分素材教程。" : ""}\n\n新增请求最多 ${summary.maxNewCalls} 次（首次最多1次规划及${MAX_TUTORIAL_CHAPTERS}次章节编写），单次输出采用当前模型上限，可能增加费用与等待。\n\n仅发送既有草稿的正文、限制说明及当前计划允许的参考材料；不发送整份长引文索引、账号凭据、保存目录或会话历史，不重传图片/音频、不重新下载视频。旧模型笔记不是已核验事实，画面材料的缺口仍会保留。\n\n${summary.resuming ? `此前已完成 ${summary.completedChapters} 章，只继续未完成章节；失败请求可能已收费，累计用量保留。本次确认也代表同意重新尝试失败步骤。` : "规划完成后还会让你确认章节与取舍，再开始写正文。"}\n\n任务ID：${summary.jobId}\n本阶段只编写正文，不新增自测或复习清单；旧检查点中的附加内容保留在原记录，但不插入新综合稿。需要学习辅助时可另行运行 /learn practice。\n原稿不会覆盖，成品仍须 /learn review 审核保存。是否继续？`, { signal });
     };
     const courseStatuses = async (store: Store, plan: Plan) => (await store.list<CourseJob>("jobs"))
       .filter(job => job.kind === "course" && job.planId === plan.id)
@@ -144,6 +149,11 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
         outputMode: job.outputMode ?? "separate", mergedDraftId: job.mergedDraftId, mergeError: job.mergeError,
         inputs: job.inputs, origin: job.origin, stoppedLabel: job.stoppedLabel,
         tutorialDraftId: job.tutorialDraftId, tutorialJobId: job.tutorialJobId, tutorialError: job.tutorialError }));
+    const practiceStatuses = async (store: Store, plan: Plan) => (await store.list<Record<string, unknown>>("jobs"))
+      .filter(job => job.kind === "practice" && job.planId === plan.id && ["running", "failed", "cancelled"].includes(String(job.status)))
+      .sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 10)
+      .map(job => ({ id: job.id, sourceDraftId: job.sourceDraftId, mode: job.mode, status: job.status,
+        completedBatches: Array.isArray(job.results) ? job.results.length : 0, totalBatches: job.totalBatches, error: job.error }));
     const toolOutput = Type.Object({ draftId: Type.String(), title: Type.String(), reused: Type.Boolean() });
     const generateTool = (kind: "video" | "material") => {
       pi.registerTool({
@@ -174,7 +184,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
           const details = { draftId: result.draft.id, title: result.draft.title, reused: result.reused };
           const visual = (await svc.store.material(result.draft.materialId)).kind === "bilibili-visual";
           return {
-            content: [{ type: "text", text: `${result.reused ? "复用已有草稿（未再次调用整理模型）" : "草稿已生成"}：${result.draft.title}\n${visual ? "材料仅为采样画面，不含声音，不是视频全文或完整课程总结。\n" : ""}草稿ID：${result.draft.id}\n尚未写入成品目录。用户运行 /learn review ${result.draft.id} 预览并确认保存。` }],
+            content: [{ type: "text", text: `${result.reused ? "复用已有草稿（未再次调用整理模型）" : "草稿已生成"}：${result.draft.title}\n${visual ? "材料仅为采样画面，不含声音，不是视频全文或完整课程总结。\n" : ""}草稿ID：${result.draft.id}\n尚未写入成品目录。用户运行 /learn review ${result.draft.id} 预览并确认保存。\n需要自测或复习清单时，可由用户另行运行 /learn practice ${result.draft.id}；不要自动调用。` }],
             structuredContent: details, details, usage: result.usage,
           };
         },
@@ -233,8 +243,38 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
         const result = await work(signal, signal => service().tutorial(params.input, modelRunner(ctx), tutorialApproval(ctx), signal,
           message => onUpdate?.({ content: [{ type: "text", text: message }], details: undefined })));
         return { content: [{ type: "text", text: result.status === "draft"
-          ? `${result.reused ? "复用已有综合教程，未再次调用模型" : "综合教程已生成"}。草稿ID：${result.draftId}\n运行 /learn review ${result.draftId} 审核保存；不是已核验事实。`
+          ? `${result.reused ? "复用已有综合教程，未再次调用模型" : "综合教程已生成"}。草稿ID：${result.draftId}\n运行 /learn review ${result.draftId} 审核保存；不是已核验事实。\n需要自测或复习清单时，可由用户另行运行 /learn practice ${result.draftId}；不要自动调用。`
           : `综合已停止：${result.error}\n已完成规划/章节与用量保留；由用户运行 /learn tutorial ${result.jobId} 再次确认后继续，不自动重试。` }], details: result, usage: result.usage };
+      },
+    });
+    pi.registerTool({
+      name: "learn_practice", label: "生成可选学习辅助",
+      description: "仅在用户要求自测或复习清单时，基于已有正文草稿生成独立学习辅助草稿。通过对话框选择自测题与答案、复习清单或两者，并另行确认累计用量；不改正文、不重新获取音视频、不自动重试或发布。",
+      promptSnippet: "正文完成后不要自动调用 learn_practice；用户明确要求学习辅助时才调用，失败不重做正文。",
+      promptGuidelines: ["预算和内容类别须由工具内用户对话框确认；停止后不得自动重试。", "题目依据旧稿，不是原视频题库或已核验答案；仍须 /learn review 审核保存，不能用write发布。"],
+      parameters: Type.Object({ input: Type.String({ description: "已有正文草稿ID（单视频讲义、合并稿或综合教程）；不接受文件路径或学习辅助草稿ID" }) }),
+      executionMode: "sequential",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      async execute(_id, params, signal, onUpdate, ctx) {
+        requireUI(ctx);
+        const svc = service(), run = modelRunner(ctx);
+        const result = await work(signal, async signal => {
+          const source = await svc.store.draft(params.input);
+          if (source.kind === "practice") throw new LearnError("INVALID_PRACTICE_SOURCE", "请提供正文草稿 ID，不对学习辅助草稿再次出题。");
+          const choices: { label: string; mode: PracticeMode }[] = [
+            { label: "自测题与参考答案", mode: "questions" }, { label: "复习清单", mode: "checklist" }, { label: "自测题、参考答案与复习清单", mode: "both" },
+          ];
+          const selected = await ctx.ui.select("选择可选学习辅助（不修改正文）", choices.map(item => item.label), { signal });
+          const choice = choices.find(item => item.label === selected);
+          if (!choice) throw new LearnError("PRACTICE_DECLINED", "已取消学习辅助生成，没有调用模型。");
+          return generatePractice(svc.store, source.id, choice.mode, run, async (summary, signal) =>
+            ctx.ui.confirm(summary.resuming ? "确认继续学习辅助生成？" : "确认单独生成学习辅助？",
+              `${summary.title}\n选择：${choice.label}\n正文约 ${summary.sourceCharacters} 字符，分 ${summary.totalBatches} 批；已完成 ${summary.completedBatches} 批，本次最多新增 ${summary.maxNewCalls} 次模型请求。单次输出遵循当前模型上限，会额外消耗额度。\n\n仅发送已选正文草稿的文本（不含开头元数据区）与学习目标；文本中包含的来源索引、补充、用户编辑和限制也会发送，请确认无不愿共享的内容。不读取任意路径，不重传图片/音频。原稿不是已核验事实，自测答案需人工检查，不保证覆盖全部知识。\n\n${summary.resuming ? "会复用相同正文版本与类别的成功批次；本次确认允许重试未完成批次，失败请求可能已收费。" : "正文保留，学习辅助另存草稿；失败不影响正文，不自动重试。"}\n\n任务ID：${summary.jobId}\n完成后仍须 /learn review 审核保存。是否继续？`, { signal }), signal,
+            message => onUpdate?.({ content: [{ type: "text", text: message }], details: undefined }));
+        });
+        return { content: [{ type: "text", text: result.status === "draft"
+          ? `${result.reused ? "复用已有学习辅助，未再次调用模型" : "学习辅助草稿已生成"}：${result.draftId}\n正文未修改。用户运行 /learn review ${result.draftId} 审核保存；参考答案未独立核验。`
+          : `学习辅助已停止：${result.error}\n正文未修改，成功批次与已知用量保留。由用户再次运行 /learn practice ${result.sourceDraftId} 并选择相同类别，确认后继续；不自动重试。` }], details: result, usage: result.usage };
       },
     });
     pi.registerTool({
@@ -249,6 +289,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
           drafts: drafts.map(d => ({ id: d.id, title: d.title, createdAt: d.createdAt, published: d.publishedPaths.length > 0 })),
           unfinishedJobs: jobs.slice(-10).map(j => ({ id: j.id, status: j.status, errorCode: j.errorCode })),
           courses: await courseStatuses(store, plan),
+          practiceJobs: await practiceStatuses(store, plan),
           tutorialJobs: (await store.list<Record<string, unknown>>("jobs")).filter(j => j.kind === "tutorial" && j.planId === plan.id && ["running", "failed", "cancelled"].includes(String(j.status)))
             .map(j => ({ id: j.id, sourceCourseId: j.sourceCourseId, status: j.status, completedChapters: Array.isArray(j.chapters) ? j.chapters.length : 0, error: j.error })) };
         return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
@@ -335,7 +376,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
       if (background === undefined) return;
       const focus = await ctx.ui.input("希望覆盖/排除什么（可留空）");
       if (focus === undefined) return;
-      const noteStyle = await ctx.ui.input("笔记形式", "概念解释、要点、例子与自测");
+      const noteStyle = await ctx.ui.input("正文形式（自测与复习清单可在正文完成后另选）", "概念解释、要点与例子");
       if (noteStyle === undefined) return;
       const language = await ctx.ui.input("输出语言", "zh-CN");
       if (language === undefined) return;
@@ -345,7 +386,7 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
       if (!await ctx.ui.confirm("确认计划与模型数据传输", `主题：${topic}\n目标：${goal}\n目录：${outputDir}\n\n字幕、学习目标和主动提供的参考材料将发送给 pi 当前模型服务，并消耗相应额度。账号 Cookie 不发送给模型。是否同意并创建计划？`)) return;
       const store = service().store;
       const plan = validatePlan({ schemaVersion: 1, id: store.newPlanId(), revision: 1, title, topic, goal, background, focus,
-        noteStyle: noteStyle || "概念解释、要点、例子与自测", language: language || "zh-CN", outputDir: await ensureDirectory(outputDir),
+        noteStyle: noteStyle || "概念解释、要点与例子", language: language || "zh-CN", outputDir: await ensureDirectory(outputDir),
         allowModelSupplement: supplement.startsWith("允许"), consentModelTransfer: true, references: [] });
       await store.savePlan(plan);
       await store.selectPlan(plan.id);
@@ -363,35 +404,75 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
       const saved = await store.savePlan(next);
       report(`计划已更新：${saved.title}，版本 ${saved.revision}。旧文件未被修改。`);
     }
-    async function chooseDraft(ctx: ExtensionCommandContext, key: string): Promise<Draft | undefined> {
+    async function chooseDraft(ctx: ExtensionCommandContext, key: string, signal?: AbortSignal): Promise<Draft | undefined> {
       const store = service().store;
       if (key) return store.draft(key);
       const plan = await store.activePlan();
       const drafts = (await store.list<Draft>("drafts")).filter(d => d.planId === plan.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       if (!drafts.length) throw new LearnError("NO_DRAFT", "还没有草稿，请先处理一个视频或导入字幕。");
       const choices = drafts.slice(0, 30).map(d => `${d.id} | ${d.title}`);
-      const selected = await ctx.ui.select("选择草稿", choices);
+      const selected = await ctx.ui.select("选择草稿", choices, { signal });
       return selected ? store.draft(selected.split(" | ")[0]!) : undefined;
     }
     async function review(ctx: ExtensionCommandContext, key: string): Promise<void> {
       requireUI(ctx);
-      const draft = await chooseDraft(ctx, key);
-      if (!draft) return;
-      const store = service().store, plan = await store.activePlan();
-      if (plan.id !== draft.planId || plan.revision !== draft.planRevision) throw new LearnError("PLAN_CHANGED", "该草稿不是当前计划版本，请重新生成或切回对应计划。");
-      const edited = await ctx.ui.editor("预览/编辑草稿；退出后还需确认成品保存", draft.markdown);
-      if (edited === undefined) return;
-      if (!edited.trim()) throw new LearnError("INVALID_DRAFT", "草稿不能为空。");
-      await store.updateDraft({ ...draft, markdown: edited });
-      if (!await ctx.ui.confirm("保存到指定目录？", `计划：${plan.title}\n目标目录：${plan.outputDir}\n文件：${draft.title}\n\n已有文件不会被覆盖；同名且内容不同会新增版本。取消仍保留本地草稿。`)) return;
-      const destination = await service().publish(draft.id, edited);
-      report(`已保存：${destination}`);
+      await work(ctx.signal, async signal => {
+        const draft = await chooseDraft(ctx, key, signal);
+        if (!draft) return;
+        const svc = service(), store = svc.store, plan = await store.activePlan();
+        if (plan.id !== draft.planId || plan.revision !== draft.planRevision) throw new LearnError("PLAN_CHANGED", "该草稿不是当前计划版本，请重新生成或切回对应计划。");
+        const external = "外部应用打开 Markdown（推荐，使用运行 pi 的电脑）";
+        const manual = "只显示审核文件路径（适合远程/手动打开）";
+        const terminal = "仍使用终端编辑器";
+        const mode = await ctx.ui.select("选择文档审核方式；外部打开不是发布", [external, manual, terminal], { signal });
+        if (![external, manual, terminal].includes(mode ?? "")) return;
+        signal.throwIfAborted();
+        let edited: string | undefined, reviewFile: ReviewFile | undefined;
+        if (mode === terminal) edited = await ctx.ui.editor("预览/编辑草稿；退出后还需确认成品保存", draft.markdown);
+        else {
+          try { reviewFile = await prepareReviewFile(store, draft); }
+          catch (error) {
+            if (!(error instanceof LearnError) || error.code !== "REVIEW_STALE") throw error;
+            if (await ctx.ui.confirm("旧审核副本与当前正文不一致", `${error.message}\n\n是否从当前正文创建新的审核副本？旧文件保留，不覆盖其中的编辑。取消后可先手动检查旧副本。`, { signal }) !== true) return;
+            signal.throwIfAborted();
+            reviewFile = await prepareReviewFile(store, draft, true);
+          }
+          report(`审核副本（尚未发布）：\n${reviewFile.filePath}\n\n请在 Markdown 应用中查看/编辑，并保存为 UTF-8；完成后回到 pi 读取修改并确认成品保存。副本保留在插件工作目录，不会自动加入知识库。外部应用的渲染、网络访问和云同步由该应用设置决定；请使用你信任的编辑器。`);
+          if (mode === external) {
+            try {
+              await openReviewFile(store, reviewFile, signal);
+              ctx.ui.notify("已请求系统默认应用打开审核副本；若没有出现窗口，请按显示路径手动打开。", "info");
+            } catch (error) {
+              if (!(error instanceof LearnError) || !["REVIEW_OPEN_FAILED", "REVIEW_OPEN_UNSUPPORTED"].includes(error.code)) throw error;
+              ctx.ui.notify(error.message, "warning");
+            }
+          }
+          const ready = "已在外部保存，读取审核文件";
+          if (await ctx.ui.select(`完成外部审核后再继续（文件位于运行 pi 的电脑）：\n${reviewFile.filePath}`, [ready, "暂不导入，保留审核副本"], { signal }) !== ready) {
+            report(`未导入修改或发布，审核副本已保留：${reviewFile.filePath}`); return;
+          }
+          edited = await readReviewFile(store, reviewFile, signal);
+        }
+        signal.throwIfAborted();
+        if (edited === undefined) return;
+        const editedHash = hash(edited);
+        await svc.saveReviewedDraft(draft.id, edited, hash(draft.markdown));
+        if (reviewFile) await acknowledgeReviewFile(store, reviewFile, editedHash);
+        signal.throwIfAborted();
+        if (await ctx.ui.confirm("将已审核的内容保存到指定目录？", `计划：${plan.title}\n目标目录：${plan.outputDir}\n文件：${draft.title}\n本次读取：${edited.length} 字符；版本校验 ${editedHash.slice(0, 12)}${reviewFile ? `\n审核副本：${reviewFile.filePath}\n请勿在确认期间继续编辑；变化后会要求重新审核。` : ""}\n\n已有文件不会被覆盖；同名且内容不同会新增版本。取消仍保留已读入的本地草稿，不发布成品。`, { signal }) !== true) return;
+        signal.throwIfAborted();
+        if (reviewFile && hash(await readReviewFile(store, reviewFile, signal)) !== editedHash) {
+          throw new LearnError("REVIEW_FILE_CHANGED", "最终确认期间审核文件又被修改，未发布；请重新运行 /learn review 读取并确认最新内容。");
+        }
+        const destination = await svc.publish(draft.id, undefined, editedHash);
+        report(`已保存：${destination}`);
+      });
     }
 
     pi.registerCommand("learn", {
-      description: "Nibblearn：学习计划与视频材料笔记，setup / auth / video / course / tutorial / import / review",
+      description: "Nibblearn：学习计划与视频材料笔记，setup / auth / video / course / tutorial / practice / import / review",
       getArgumentCompletions(prefix) {
-        return ["setup", "plans", "use", "config", "auth", "video", "course", "tutorial", "import", "reference", "review", "save", "status", "retry", "resume", "cancel"]
+        return ["setup", "plans", "use", "config", "auth", "video", "course", "tutorial", "practice", "import", "reference", "review", "save", "status", "retry", "resume", "cancel"]
           .filter(value => value.startsWith(prefix)).map(value => ({ value, label: value }));
       },
       async handler(args, ctx) {
@@ -442,6 +523,12 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
             await store.savePlan({ ...plan, references: [...plan.references.filter(r => r.id !== reference.id), reference] });
             report("参考材料已添加，计划版本已更新。此操作没有检索网页，也没有认证资料权威性。"); return;
           }
+          if (command === "practice") {
+            const key = argument.trim();
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(key)) throw new LearnError("INVALID_ID", "请提供正文草稿 ID，不要提供文件路径。");
+            pi.sendUserMessage(`用户要求可选学习辅助。请仅调用 learn_practice，input=${JSON.stringify(key)}。类别和额外用量由工具内对话框确认；不重写正文，停止后不要自动重试，不要用write发布。`, { deliverAs: "followUp" });
+            return;
+          }
           if (command === "tutorial") {
             const key = argument.trim();
             if (!/^[a-zA-Z0-9_-]{1,80}$/.test(key)) throw new LearnError("INVALID_ID", "请提供课程或草稿ID，不要提供文件路径。");
@@ -468,6 +555,8 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
             const drafts = (await store.list<Draft>("drafts")).filter(d => d.planId === plan.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 10);
             const jobs = (await store.list<Record<string, unknown>>("jobs")).filter(j => j.kind === "generation" && j.planId === plan.id && ["running", "failed", "cancelled"].includes(String(j.status)));
             const courses = await courseStatuses(store, plan);
+            const practices = await practiceStatuses(store, plan);
+            if (practices.length) report(`未完成学习辅助（正文不受影响）：\n${practices.map(j => `- ${j.id}：${j.status}，${j.completedBatches}/${j.totalBatches} 批，类别 ${j.mode}；${j.error ?? ""}；继续：/learn practice ${j.sourceDraftId}`).join("\n")}\n选择相同类别并重新确认用量后继续；不自动重试。`);
             const tutorials = (await store.list<Record<string, unknown>>("jobs")).filter(j => j.kind === "tutorial" && j.planId === plan.id && ["running", "failed", "cancelled"].includes(String(j.status)));
             if (tutorials.length) report(`未完成教程综合（需再次确认用量，不自动重试）：\n${tutorials.map(j => `- ${j.id}：${j.status}，已保存 ${Array.isArray(j.chapters) ? j.chapters.length : 0} 章；${j.error ?? ""}`).join("\n")}\n运行 /learn tutorial <任务ID> 可人工确认后继续。`);
             if (courses.length) report(`分 P 课程进度（running 也可能是上次退出遗留，不代表正在执行）：\n${courses.map(c => `- ${c.bvid}：${c.completed}/${c.total}，${c.status}${c.stoppedPart ? `，停止于 ${c.stoppedLabel ?? `P${c.stoppedPart}`}` : ""}${c.error ? `；${c.error}` : ""}${c.mergedDraftId ? `；合并稿 ${c.mergedDraftId}` : ""}${c.mergeError ? `；合并失败：${c.mergeError}` : ""}${c.origin === "manual" ? `；继续输入：/learn course ${c.inputs!.join(" ")}` : ""}`).join("\n")}\n由用户运行 /learn course <BV号或多个链接> 确认后继续；已完成项可复用。`);

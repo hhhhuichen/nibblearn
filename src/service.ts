@@ -9,6 +9,7 @@ import { modelPrompt, parseNotes, PROMPT_VERSION, renderMarkdown, splitSegments,
 import { publishMarkdown } from "./files.ts";
 import { COURSE_DOCUMENT_VERSION, renderCourseMarkdown } from "./course.ts";
 import { synthesizeCourse } from "./tutorial.ts";
+import { validateReviewedMarkdown } from "./review.ts";
 
 export const MAX_MODEL_CALLS = 12;
 export class LearnService {
@@ -93,7 +94,7 @@ export class LearnService {
           let result: CoursePartResult;
           if (prior) {
             const draft = await this.store.draft(prior.draftId);
-            if (draft.kind === "course") throw new LearnError("INVALID_COURSE_CACHE", "分 P 缓存误指向合并稿，已停止处理。");
+            if (draft.kind === "course" || draft.kind === "practice") throw new LearnError("INVALID_COURSE_CACHE", "分 P 缓存误指向非材料草稿，已停止处理。");
             const material = await this.store.material(draft.materialId);
             const visual = material.kind === "bilibili-visual";
             const expectedId = hash({ plan, material: material.id, prompt: visual ? `${PROMPT_VERSION}-visual-v1` : PROMPT_VERSION });
@@ -157,7 +158,7 @@ export class LearnService {
     let inputCharacters = 0;
     for (const part of job.completed) {
       const draft = await this.store.draft(part.draftId);
-      if (draft.kind === "course" || draft.planId !== plan.id || draft.planRevision !== plan.revision) {
+      if (draft.kind === "course" || draft.kind === "practice" || draft.planId !== plan.id || draft.planRevision !== plan.revision) {
         throw new LearnError("INVALID_COURSE_CACHE", "合并来源不是当前计划版本的分 P 草稿。");
       }
       inputCharacters += draft.markdown.length;
@@ -210,7 +211,7 @@ export class LearnService {
       const previous = await this.store.read<Draft>("drafts", draftId);
       if (previous) {
         const draft = await this.store.draft(draftId);
-        if (draft.kind === "course") throw new LearnError("INVALID_DRAFT", "单份材料缓存误指向合并讲义。");
+        if (draft.kind === "course" || draft.kind === "practice") throw new LearnError("INVALID_DRAFT", "单份材料缓存误指向非材料草稿。");
         return { draft, reused: true, usage: emptyUsage() };
       }
       const prior = await this.store.read<Record<string, unknown>>("jobs", draftId);
@@ -265,17 +266,26 @@ export class LearnService {
       return String(job.materialId);
     });
   }
-  async publish(draftId: string, editedMarkdown?: string): Promise<string> {
+  async saveReviewedDraft(draftId: string, markdown: string, expectedHash: string): Promise<void> {
+    validateReviewedMarkdown(markdown);
+    await this.store.lock(`publish-${draftId}`, async () => {
+      const draft = await this.store.draft(draftId), plan = await this.store.activePlan();
+      if (draft.planId !== plan.id || draft.planRevision !== plan.revision) throw new LearnError("PLAN_CHANGED", "审核期间学习计划已改变，请重新选择草稿。");
+      if (hash(draft.markdown) !== expectedHash) throw new LearnError("REVIEW_CONFLICT", "审核期间草稿已被其他操作修改，未覆盖；请重新审核。");
+      await this.store.updateDraft({ ...draft, markdown });
+    });
+  }
+  async publish(draftId: string, editedMarkdown?: string, expectedHash?: string): Promise<string> {
     return this.store.lock(`publish-${draftId}`, async () => {
       const draft = await this.store.draft(draftId);
       const plan = await this.store.activePlan();
       if (draft.planId !== plan.id || draft.planRevision !== plan.revision) {
         throw new LearnError("PLAN_CHANGED", "当前计划或版本与草稿不一致。请切回原计划并重新生成，不能默默改写保存位置。");
       }
-      if (editedMarkdown !== undefined) {
-        if (!editedMarkdown.trim() || editedMarkdown.length > 2_000_000) throw new LearnError("INVALID_DRAFT", "草稿为空或超过大小限制。");
-        draft.markdown = editedMarkdown;
+      if (expectedHash !== undefined && hash(draft.markdown) !== expectedHash) {
+        throw new LearnError("REVIEW_CONFLICT", "最终确认期间草稿发生变化，未发布；请重新审核。");
       }
+      if (editedMarkdown !== undefined) draft.markdown = validateReviewedMarkdown(editedMarkdown);
       const destination = await publishMarkdown(plan.outputDir, plan.id, draft.title, draft.id, draft.markdown);
       draft.publishedPaths = [...new Set([...draft.publishedPaths, destination])];
       await this.store.updateDraft(draft);

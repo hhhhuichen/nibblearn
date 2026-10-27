@@ -199,7 +199,24 @@ export interface CourseDraft extends DraftBase {
   kind: "course";
   course: { jobId: string; bvid: string; total: number; parts: CoursePartResult[]; tutorial?: boolean };
 }
-export type Draft = MaterialDraft | CourseDraft;
+export type PracticeMode = "questions" | "checklist" | "both";
+export interface PracticeDraft extends DraftBase {
+  kind: "practice";
+  practice: { jobId: string; sourceDraftId: string; sourceHash: string; mode: PracticeMode };
+}
+export type Draft = MaterialDraft | CourseDraft | PracticeDraft;
+export interface PracticeApproval {
+  jobId: string;
+  title: string;
+  sourceDraftId: string;
+  mode: PracticeMode;
+  totalBatches: number;
+  completedBatches: number;
+  maxNewCalls: number;
+  resuming: boolean;
+  sourceCharacters: number;
+}
+export type ApprovePractice = (summary: PracticeApproval, signal?: AbortSignal) => Promise<boolean>;
 
 export interface TutorialApproval {
   stage: "budget" | "outline";

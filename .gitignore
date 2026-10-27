@@ -27,6 +27,7 @@ credentials*.json
 /plans/
 /materials/
 /drafts/
+/reviews/
 /jobs/
 /locks/
 /traffic/

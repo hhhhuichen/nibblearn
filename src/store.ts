@@ -6,7 +6,7 @@ import { hash, id, object, parseJson, validateCredentials, validatePlan, validat
 import { LearnError } from "./types.ts";
 import type { Credentials, Draft, Material, Plan } from "./types.ts";
 
-type Bucket = "plans" | "drafts" | "materials" | "jobs" | "secrets" | "locks" | "traffic";
+type Bucket = "plans" | "drafts" | "materials" | "jobs" | "secrets" | "locks" | "traffic" | "reviews";
 export class Store {
   readonly home: string;
   constructor(home = defaultHome()) { this.home = path.resolve(home); }
