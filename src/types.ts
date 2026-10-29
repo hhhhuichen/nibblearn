@@ -188,6 +188,8 @@ interface DraftBase {
   createdAt: string;
   usage: ModelUsage;
   publishedPaths: string[];
+  /** Local presentation variant; the indexed source snapshot remains untouched. */
+  readingVersion?: { sourceDraftId: string; sourceHash: string };
 }
 
 export interface MaterialDraft extends DraftBase {
@@ -249,11 +251,21 @@ export class LearnError extends Error {
     this.code = code;
   }
 }
+/** Numeric/closed-enum diagnostics only: never persist response bodies, headers or provider errors. */
+export interface ModelRunDiagnostics {
+  stopReason: "stop" | "length" | "error" | "toolUse" | "unknown" | "request_failed";
+  maxTokens: number;
+  modelMaxTokens: number;
+  contextWindow: number;
+  estimatedInputTokens: number;
+}
 export class ModelRunError extends LearnError {
   readonly usage?: ModelUsage;
-  constructor(code: string, message: string, usage?: ModelUsage) {
+  readonly diagnostics?: ModelRunDiagnostics;
+  constructor(code: string, message: string, usage?: ModelUsage, diagnostics?: ModelRunDiagnostics) {
     super(code, message);
     this.usage = usage;
+    this.diagnostics = diagnostics;
   }
 }
 export function publicError(error: unknown): string {

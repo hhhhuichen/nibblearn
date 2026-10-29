@@ -1,5 +1,6 @@
 import type { Store } from "./store.ts";
 import { cleanMarkdown } from "./notes.ts";
+import { MATH_GUIDANCE } from "./formatting.ts";
 import { hash, id, object, parseJson, text } from "./validate.ts";
 import { addUsage, emptyUsage } from "./usage.ts";
 import { LearnError, ModelRunError, publicError } from "./types.ts";
@@ -106,6 +107,7 @@ const SYSTEM = `你为已有学习文档编写可选的学习辅助内容，不�
 仅依据本批正文可支持的概念、条件和材料例子出题。题目和参考答案是模型生成的学习辅助，不是视频原题或已核验标准答案。不要补造参数、混用不同案例，不能据缺失公式、未展示步骤或仅有稀疏画面描述的内容编答案；不确定或缺少前提时少出题，并在 caveats 保留局限。旧稿补充和用户编辑不等同于原视频证据。
 每题/每项复习任务用 sourceIds 引用本批 blocks 中实际支持它的 B 编号；编号仅定位正文，不代表事实核验。答案可归纳或按已给条件推导，不引入外部事实。不要针对个人提供医疗、法律或投资建议。不要把目录、来源索引或旧题库机械改成新题，不强求覆盖每个文本块。
 少而有针对性地检验解释、计算、排错或应用；通常每批3至6题、3至8项复习任务即可，这只是建议，不需要凑数。不要为满足形式压缩必要的推理。mode 决定本次生成内容，不生成未选择的栏目。
+${MATH_GUIDANCE}
 只返回 output 对应的 JSON 对象，无代码围栏；无可生成内容时数组为空。limits 是安全上限而不是题量目标，文本长度按 JavaScript 字符串长度计。字符串内换行正确 JSON 转义；不要 HTML、图片或外部链接。`;
 function prompt(plan: Plan, source: Draft, batch: Block[], index: number, total: number, mode: PracticeMode): string {
   return JSON.stringify({ task: `仅生成${modeLabel(mode)}。这只是整篇草稿的第 ${index + 1}/${total} 批，不代表整门课程已覆盖。`, mode,

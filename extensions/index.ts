@@ -12,8 +12,10 @@ import { findFfmpeg } from "../src/media.ts";
 import { MAX_TUTORIAL_CALLS, MAX_TUTORIAL_CHAPTERS } from "../src/tutorial.ts";
 import { generatePractice } from "../src/practice.ts";
 import { acknowledgeReviewFile, openReviewFile, prepareReviewFile, readReviewFile } from "../src/review.ts";
+import { createReadingDraft } from "../src/reading.ts";
 import type { ReviewFile } from "../src/review.ts";
-import { courseUnitLabel, LearnError, ModelRunError, publicError } from "../src/types.ts";
+import { courseUnitLabel, LearnError, publicError } from "../src/types.ts";
+import { modelRunner } from "../src/model-runner.ts";
 import type { CourseJob, CourseOutputMode, CourseScope, ApproveTutorial, Draft, ModelRunner, Plan, PracticeMode, VideoSource } from "../src/types.ts";
 import { hash, parseJson, validatePlan } from "../src/validate.ts";
 
@@ -29,7 +31,7 @@ const HELP = `# Nibblearn
 - practice <正文草稿ID>：可选生成自测题与答案、复习清单或两者；单独确认用量，另存草稿，不修改正文
 - import <字幕文件路径>：导入 SRT/VTT/JSON 后生成草稿，不必登录 Bilibili
 - reference <文本文件路径>：添加用户提供的参考材料（.md/.txt，最多8000字符）
-- review [草稿ID] / save [草稿ID]：选择外部应用/文件路径/终端审核；外部编辑保存后回到 pi 确认，绝不自动发布或覆盖成品
+- review [草稿ID] / save [草稿ID]：正文默认带来源索引，也可选择本机生成无索引阅读版；再选择外部应用/文件路径/终端审核，确认后才保存，不覆盖原稿
 - status：查看计划、最近草稿与失败任务
 - retry <任务ID>：人工确认后重试失败或中断任务
 - resume：人工处理登录/验证码后解除本地账号暂停，不绕过平台退避
@@ -43,54 +45,6 @@ const HELP = `# Nibblearn
 function requireUI(ctx: ExtensionContext): void {
   if (!ctx.hasUI) throw new LearnError("UI_REQUIRED", "此操作需要交互确认，请在 pi 终端或支持对话框的 RPC 客户端运行。");
 }
-function modelRunner(ctx: ExtensionContext): ModelRunner {
-  const model = ctx.model;
-  if (!model) throw new LearnError("NO_MODEL", "请先在 pi 中选择并登录一个模型。");
-  const imageLimits = model.inputLimits?.images;
-  const imageLimit = Math.min(2, imageLimits?.maxPerMessage ?? 2, imageLimits?.maxPerRequest ?? 2);
-  const run: ModelRunner = async request => {
-    const images = request.images ?? [];
-    if (images.length && !model.input.includes("image")) throw new LearnError("VISION_MODEL_REQUIRED", "当前模型不支持图片输入，请通过 /model 切换看图模型。");
-    if (images.length > imageLimit) throw new LearnError("VISION_MODEL_LIMIT", "图片数量超过当前模型的单次上限，没有静默丢弃画面。");
-    if (!Number.isSafeInteger(model.maxTokens) || model.maxTokens <= 0
-      || !Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0) {
-      throw new LearnError("MODEL_LIMITS", "当前模型未声明有效的最大输出量或上下文窗口，请检查 pi 模型配置；没有猜测额度或发起请求。");
-    }
-    if (request.maxTokens !== undefined && (!Number.isSafeInteger(request.maxTokens) || request.maxTokens <= 0)) {
-      throw new LearnError("MODEL_LIMITS", "请求的输出上限必须是正整数。");
-    }
-    // Conservative estimate, not exact tokenization or billing; images vary by provider.
-    const inputBudget = Buffer.byteLength(request.system + request.prompt, "utf8") + images.length * 8192 + 1024;
-    const availableOutput = model.contextWindow - inputBudget;
-    if (availableOutput < 1) {
-      throw new LearnError("MODEL_CONTEXT", "当前模型上下文不足，请选择更大上下文模型、减少参考资料或拆分字幕；未截断材料。");
-    }
-    const maxTokens = Math.min(request.maxTokens ?? model.maxTokens, model.maxTokens, availableOutput);
-    const content = [{ type: "text" as const, text: request.prompt }, ...images.map(image => ({ type: "image" as const, ...image }))];
-    const context = { systemPrompt: request.system, messages: [{ role: "user" as const, content, timestamp: Date.now() }] };
-    if (model.inputLimits?.maxRequestBytes && Buffer.byteLength(JSON.stringify(context), "utf8") + 4096 > model.inputLimits.maxRequestBytes) {
-      throw new LearnError("MODEL_REQUEST_SIZE", "图文请求超过当前模型的请求大小上限，没有截断图片。");
-    }
-    let response;
-    try {
-      response = await ctx.modelRegistry.streamSimple(model, {
-        ...context,
-        // No tools and no conversation history are provided to the nested model.
-      }, { signal: request.signal, maxTokens, cacheRetention: "none" }).result();
-    } catch {
-      if (request.signal?.aborted) throw request.signal.reason;
-      throw new LearnError("MODEL_REQUEST_FAILED", "当前模型调用失败，请检查 pi 的模型连接；未回显服务端请求详情。");
-    }
-    if (response.stopReason === "aborted") throw new DOMException("Cancelled", "AbortError");
-    if (response.stopReason !== "stop") throw new ModelRunError("MODEL_INCOMPLETE", "模型输出未正常完成，可能达到输出限制；没有发布不完整笔记。", response.usage);
-    const output = response.content.filter(c => c.type === "text").map(c => c.text).join("\n");
-    return { text: output, usage: response.usage };
-  };
-  run.supportsImages = model.input.includes("image");
-  run.maxImagesPerRequest = imageLimit;
-  return run;
-}
-
 export function createLearnExtension(options: { home?: string; transport?: typeof fetch } = {}) {
   return function nibblearnPi(pi: ExtensionAPI): void {
     // Registration only. Do not read credentials, create directories or start timers on load.
@@ -417,10 +371,21 @@ export function createLearnExtension(options: { home?: string; transport?: typeo
     async function review(ctx: ExtensionCommandContext, key: string): Promise<void> {
       requireUI(ctx);
       await work(ctx.signal, async signal => {
-        const draft = await chooseDraft(ctx, key, signal);
+        let draft = await chooseDraft(ctx, key, signal);
         if (!draft) return;
         const svc = service(), store = svc.store, plan = await store.activePlan();
         if (plan.id !== draft.planId || plan.revision !== draft.planRevision) throw new LearnError("PLAN_CHANGED", "该草稿不是当前计划版本，请重新生成或切回对应计划。");
+        if (!draft.readingVersion && draft.kind !== "practice") {
+          const indexed = "带来源索引（默认，保留编号与视频时间定位）";
+          const reading = "无索引阅读版（本机整理，不额外调用模型）";
+          const edition = await ctx.ui.select("选择文档版本；无索引不代表补齐缺口或已核验", [indexed, reading], { signal });
+          if (edition !== indexed && edition !== reading) return;
+          signal.throwIfAborted();
+          if (edition === reading) {
+            draft = await createReadingDraft(store, draft.id, hash(draft.markdown));
+            report(`无索引阅读草稿：${draft.id}\n带索引原稿及来源材料保留，转换没有调用模型；下面仍需审核并确认保存。`);
+          }
+        }
         const external = "外部应用打开 Markdown（推荐，使用运行 pi 的电脑）";
         const manual = "只显示审核文件路径（适合远程/手动打开）";
         const terminal = "仍使用终端编辑器";

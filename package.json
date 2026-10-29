@@ -10,7 +10,8 @@
   "pi": { "extensions": ["./extensions/index.ts"] },
   "scripts": {
     "start": "pi -e ./extensions/index.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.4.0 <2",

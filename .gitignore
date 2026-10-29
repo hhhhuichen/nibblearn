@@ -33,8 +33,7 @@ credentials*.json
 /traffic/
 /settings.json
 
-# Development-only assets are not part of this source-only repository
-/tests/
+# Other development-only assets; regression tests remain versionable
 /scripts/
 /examples/
 /.github/
